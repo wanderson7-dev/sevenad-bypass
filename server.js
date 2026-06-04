@@ -4,7 +4,14 @@ const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const archiver = require('archiver');
-const ffmpegPath = require('ffmpeg-static');
+// Usa ffmpeg do sistema (Docker/Railway) se disponível, senão usa ffmpeg-static (local)
+const { execSync } = require('child_process');
+let ffmpegPath;
+try {
+  ffmpegPath = execSync('which ffmpeg').toString().trim();
+} catch {
+  ffmpegPath = require('ffmpeg-static');
+}
 
 const app = express();
 const upload = multer({ dest: '/tmp' });
