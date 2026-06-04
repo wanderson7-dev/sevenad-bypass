@@ -488,6 +488,30 @@
             overflow: hidden;
         }
 
+        /* Hidden audio dropzone */
+        .hidden-dropzone {
+            border: 1px dashed var(--glass-border);
+            border-radius: 12px;
+            padding: 1rem;
+            text-align: center;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            transition: all 0.3s;
+            background: rgba(0,0,0,0.2);
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+        .hidden-dropzone:hover, .hidden-dropzone.dragover {
+            border-color: var(--primary);
+            color: var(--text-main);
+        }
+        .hidden-dropzone.has-file {
+            border-color: var(--success);
+            color: var(--success);
+        }
+
         /* Responsive */
         @media (max-width: 768px) {
             .grid-layout {
@@ -633,6 +657,49 @@
                         </p>
                     </div>
 
+                    <!-- Hidden AI Audio Card -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom: 0.5rem; border:none; padding:0;">
+                            <h3>
+                                <svg class="icon-small" viewBox="0 0 24 24">
+                                    <path d="M12 1C8.686 1 6 3.686 6 7v6c0 3.314 2.686 6 6 6s6-2.686 6-6V7c0-3.314-2.686-6-6-6zm-1 16.93V21h2v-3.07A7.003 7.003 0 0 0 19 11h-2a5 5 0 0 1-10 0H5a7.003 7.003 0 0 0 6 6.93z"/>
+                                </svg>
+                                Hidden AI Audio
+                            </h3>
+                            <label class="switch">
+                                <input type="checkbox" id="do_hidden_audio" name="do_hidden_audio">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <p class="option-desc" style="margin-top: 0.75rem; line-height: 1.5;">
+                            Embeds a ghost audio track (ultrasonic, &gt;14kHz) from a second file into your video.
+                            AI transcription models hear and transcribe it — humans and phones don't notice it.
+                        </p>
+
+                        <div id="hiddenAudioSection" style="margin-top:1.2rem; display:none; flex-direction:column; gap:0.8rem;">
+                            <!-- Dropzone for hidden audio/video -->
+                            <div class="hidden-dropzone" id="hiddenDropzone">
+                                <svg viewBox="0 0 24 24" style="width:28px;height:28px;fill:url(#grad1);margin-bottom:0.4rem;">
+                                    <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+                                </svg>
+                                <span id="hiddenDzLabel">Upload audio or video file</span>
+                                <input type="file" id="hiddenAudioInput" name="hidden_audio_file" accept="audio/*,video/*" style="display:none;">
+                            </div>
+
+                            <!-- Volume slider -->
+                            <div style="display:flex;align-items:center;gap:0.8rem;">
+                                <span class="option-desc" style="white-space:nowrap;">Ghost volume</span>
+                                <input type="range" name="hidden_audio_volume" id="hiddenVolSlider"
+                                    min="0.01" max="0.15" step="0.01" value="0.03"
+                                    style="flex:1;accent-color:var(--primary);">
+                                <span id="hiddenVolVal" style="font-size:0.85rem;color:var(--text-muted);min-width:36px;">3%</span>
+                            </div>
+                            <p class="option-desc" style="font-size:0.75rem;">
+                                Keep low (1–5%) so humans don't hear it. Higher values may bleed into audible range.
+                            </p>
+                        </div>
+                    </div>
+
                 </div>
             </div>
 
@@ -717,6 +784,42 @@
                 alert('Mídia inválida. Selecione um vídeo MP4 ou MOV.');
             }
         }
+
+        // Hidden AI Audio toggle
+        const hiddenToggle = document.getElementById('do_hidden_audio');
+        const hiddenSection = document.getElementById('hiddenAudioSection');
+        const hiddenDropzone = document.getElementById('hiddenDropzone');
+        const hiddenInput = document.getElementById('hiddenAudioInput');
+        const hiddenDzLabel = document.getElementById('hiddenDzLabel');
+        const hiddenVolSlider = document.getElementById('hiddenVolSlider');
+        const hiddenVolVal = document.getElementById('hiddenVolVal');
+
+        hiddenToggle.addEventListener('change', () => {
+            hiddenSection.style.display = hiddenToggle.checked ? 'flex' : 'none';
+        });
+
+        hiddenDropzone.addEventListener('click', () => hiddenInput.click());
+        hiddenDropzone.addEventListener('dragover', (e) => { e.preventDefault(); hiddenDropzone.classList.add('dragover'); });
+        hiddenDropzone.addEventListener('dragleave', () => hiddenDropzone.classList.remove('dragover'));
+        hiddenDropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            hiddenDropzone.classList.remove('dragover');
+            if (e.dataTransfer.files[0]) setHiddenFile(e.dataTransfer.files[0]);
+        });
+        hiddenInput.addEventListener('change', (e) => {
+            if (e.target.files[0]) setHiddenFile(e.target.files[0]);
+        });
+        function setHiddenFile(file) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            hiddenInput.files = dt.files;
+            hiddenDzLabel.textContent = `✓ ${file.name}`;
+            hiddenDropzone.classList.add('has-file');
+        }
+
+        hiddenVolSlider.addEventListener('input', () => {
+            hiddenVolVal.textContent = Math.round(hiddenVolSlider.value * 100) + '%';
+        });
 
         // Form Submit handling
         form.addEventListener('submit', async (e) => {

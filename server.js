@@ -19,8 +19,21 @@ function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-app.post('/process/', upload.single('file'), async (req, res) => {
-  if (!req.file) {
+// Extrai o áudio de um arquivo (vídeo ou áudio) para um arquivo .wav temporário
+function extractAudio(inputPath, outputPath) {
+  const result = spawnSync(ffmpegPath, [
+    '-y', '-i', inputPath,
+    '-vn', '-acodec', 'pcm_s16le', '-ar', '48000', '-ac', '2',
+    outputPath
+  ], { timeout: 60000 });
+  return result.status === 0;
+}
+
+app.post('/process/', upload.fields([
+  { name: 'file', maxCount: 1 },
+  { name: 'hidden_audio_file', maxCount: 1 }
+]), async (req, res) => {
+  if (!req.files || !req.files['file']) {
     return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
   }
 
@@ -33,14 +46,31 @@ app.post('/process/', upload.single('file'), async (req, res) => {
     randomize_gamma:         parseBool(body.randomize_gamma),
     randomize_saturation:    parseBool(body.randomize_saturation),
     randomize_brightness:    parseBool(body.randomize_brightness),
+    do_hidden_audio:         parseBool(body.do_hidden_audio),
+    hidden_audio_volume:     parseFloat(body.hidden_audio_volume) || 0.03,
   };
 
   const numCopies = Math.max(1, parseInt(body.num_copies) || 1);
-  const inputPath = req.file.path;
-  const originalName = req.file.originalname || 'video.mp4';
+  const inputFile = req.files['file'][0];
+  const hiddenFile = req.files['hidden_audio_file'] ? req.files['hidden_audio_file'][0] : null;
+
+  const inputPath = inputFile.path;
+  const originalName = inputFile.originalname || 'video.mp4';
   const ext = path.extname(originalName);
   const name = path.basename(originalName, ext);
   const randPrefix = randInt(10000, 99999);
+
+  // Prepara áudio fantasma se habilitado
+  let hiddenAudioPath = null;
+  if (settings.do_hidden_audio && hiddenFile) {
+    hiddenAudioPath = `/tmp/${randPrefix}_hidden.wav`;
+    const ok = extractAudio(hiddenFile.path, hiddenAudioPath);
+    if (!ok) {
+      console.warn('Falha ao extrair áudio fantasma, ignorando.');
+      hiddenAudioPath = null;
+    }
+    try { fs.unlinkSync(hiddenFile.path); } catch {}
+  }
 
   const generatedFiles = [];
 
@@ -49,7 +79,6 @@ app.post('/process/', upload.single('file'), async (req, res) => {
     const outputFilename = `/tmp/${randPrefix}_${name}_${i}_${randNum}${ext}`;
 
     const vfParts = [];
-    const afParts = [];
     let randVolume = 100;
 
     if (settings.do_uniqueize) {
@@ -62,7 +91,6 @@ app.post('/process/', upload.single('file'), async (req, res) => {
       if (settings.randomize_resolution) {
         vfParts.push(`scale=ceil(iw*${randSize}/100/2)*2:-2`);
       }
-
       vfParts.push(
         `eq=gamma=${randGamma / 100}:saturation=${randSaturation / 100}:brightness=${randBrightness}`
       );
@@ -70,15 +98,43 @@ app.post('/process/', upload.single('file'), async (req, res) => {
       vfParts.push('setsar=1');
     }
 
-    if (settings.do_uniqueize && settings.randomize_volume) {
-      afParts.push(`volume=${randVolume / 100}`);
+    // Monta filtros de áudio
+    const useHidden = settings.do_hidden_audio && hiddenAudioPath;
+    const vol = settings.do_hidden_audio ? settings.hidden_audio_volume : 0.03;
+
+    let audioFilter = '';
+    const extraInputs = useHidden ? ['-i', hiddenAudioPath] : [];
+
+    if (useHidden) {
+      // Áudio fantasma: frequências acima de 14kHz, volume muito baixo → inaudível para humano
+      let mainChain = '[0:a]';
+      if (settings.do_uniqueize && settings.randomize_volume) {
+        mainChain += `volume=${randVolume / 100},`;
+      }
+      if (settings.do_audio_antitranscribe) {
+        mainChain += 'pan=stereo|c0=FL|c1=-1*FR,';
+      }
+      mainChain = mainChain.replace(/,$/, '') + '[main_a]';
+
+      const hiddenChain = `[1:a]aloop=loop=-1:size=2147483647,atrim=duration=${999999},` +
+        `highpass=f=14000,volume=${vol}[hidden_a]`;
+
+      audioFilter = `${mainChain};${hiddenChain};[main_a][hidden_a]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+    } else {
+      const afParts = [];
+      if (settings.do_uniqueize && settings.randomize_volume) {
+        afParts.push(`volume=${randVolume / 100}`);
+      }
+      if (settings.do_audio_antitranscribe) {
+        afParts.push('pan=stereo|c0=FL|c1=-1*FR');
+      }
+      if (afParts.length > 0) {
+        audioFilter = afParts.join(',');
+      }
     }
 
-    if (settings.do_audio_antitranscribe) {
-      afParts.push('pan=stereo|c0=FL|c1=-1*FR');
-    }
-
-    const args = ['-y', '-i', inputPath];
+    // Monta comando FFmpeg
+    const args = ['-y', '-i', inputPath, ...extraInputs];
 
     if (settings.do_uniqueize) {
       args.push('-r', '30', '-crf', '28', '-preset', 'veryfast', '-b:v', '6.5M');
@@ -90,8 +146,10 @@ app.post('/process/', upload.single('file'), async (req, res) => {
       args.push('-c:v', 'copy');
     }
 
-    if (afParts.length > 0) {
-      args.push('-af', afParts.join(','));
+    if (useHidden) {
+      args.push('-filter_complex', audioFilter, '-map', '0:v', '-map', '[aout]');
+    } else if (audioFilter) {
+      args.push('-af', audioFilter);
     } else {
       args.push('-c:a', 'copy');
     }
@@ -109,6 +167,7 @@ app.post('/process/', upload.single('file'), async (req, res) => {
   }
 
   try { fs.unlinkSync(inputPath); } catch {}
+  if (hiddenAudioPath) { try { fs.unlinkSync(hiddenAudioPath); } catch {} }
 
   if (generatedFiles.length === 0) {
     return res.status(500).json({ error: 'Falha no processamento do vídeo.' });
@@ -146,7 +205,7 @@ app.post('/process/', upload.single('file'), async (req, res) => {
   await archive.finalize();
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
