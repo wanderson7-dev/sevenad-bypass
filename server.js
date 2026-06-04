@@ -167,7 +167,8 @@ app.post('/process/', upload.fields([
     const args = ['-y', '-i', inputPath, ...extraInputs];
 
     if (settings.do_uniqueize) {
-      args.push('-r', '30', '-crf', '28', '-preset', 'veryfast', '-b:v', '6.5M');
+      // -c:v libx264 explícito + só -crf (sem -b:v que conflita com crf no libx264)
+      args.push('-c:v', 'libx264', '-r', '30', '-crf', '28', '-preset', 'veryfast');
     }
 
     if (vfParts.length > 0) {
@@ -193,13 +194,13 @@ app.post('/process/', upload.fields([
       const ffmpegOut = result.stdout?.toString() || '';
       const outputExists = fs.existsSync(outputFilename);
 
-      console.log(`FFmpeg status=${result.status} outputExists=${outputExists}`);
-      if (ffmpegErr) console.log('FFmpeg stderr:', ffmpegErr.slice(-1000));
+      console.log(`FFmpeg status=${result.status} signal=${result.signal} outputExists=${outputExists}`);
+      if (ffmpegErr) console.log('FFmpeg stderr (last 500):', ffmpegErr.slice(-500));
 
       if (result.status === 0 && outputExists) {
         generatedFiles.push(outputFilename);
       } else {
-        lastFfmpegError = `status=${result.status} outputExists=${outputExists} err=${ffmpegErr.slice(-500) || ffmpegOut.slice(-500)}`;
+        lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} err=${ffmpegErr.slice(-300) || ffmpegOut.slice(-300)}`;
         console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
       }
     } catch (e) {
