@@ -197,10 +197,15 @@ app.post('/process/', upload.fields([
       console.log(`FFmpeg status=${result.status} signal=${result.signal} outputExists=${outputExists}`);
       if (ffmpegErr) console.log('FFmpeg stderr (last 500):', ffmpegErr.slice(-500));
 
-      if (result.status === 0 && outputExists) {
+      const outputSize = outputExists ? fs.statSync(outputFilename).size : 0;
+      const success = outputExists && outputSize > 1000; // arquivo válido
+
+      console.log(`FFmpeg outputSize=${outputSize} success=${success}`);
+
+      if (success) {
         generatedFiles.push(outputFilename);
       } else {
-        lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} err=${ffmpegErr.slice(-300) || ffmpegOut.slice(-300)}`;
+        lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} size=${outputSize} err=${ffmpegErr.slice(-300) || ffmpegOut.slice(-300)}`;
         console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
       }
     } catch (e) {
