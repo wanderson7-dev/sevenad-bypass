@@ -5,13 +5,6 @@ const fs = require('fs');
 const archiver = require('archiver');
 const ffmpegPath = require('ffmpeg-static');
 
-module.exports.config = {
-  api: {
-    bodyParser: false,
-    responseLimit: false,
-  },
-};
-
 const upload = multer({ dest: '/tmp' });
 
 function runMiddleware(req, res, fn) {
@@ -190,3 +183,10 @@ module.exports = async function handler(req, res) {
   }
   await archive.finalize();
 }
+
+module.exports.config = {
+  api: {
+    bodyParser: false,
+    responseLimit: false,
+  },
+};
