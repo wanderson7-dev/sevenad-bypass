@@ -72,8 +72,10 @@ app.post('/process/', upload.fields([
     hidden_audio_volume:     parseFloat(body.hidden_audio_volume) || 0.03,
   };
 
+  console.log('settings:', JSON.stringify(settings));
   const numCopies = Math.max(1, parseInt(body.num_copies) || 1);
   const inputFile = req.files['file'][0];
+  console.log('inputFile:', inputFile?.originalname, inputFile?.size, inputFile?.path, 'exists:', fs.existsSync(inputFile?.path));
   const hiddenFile = req.files['hidden_audio_file'] ? req.files['hidden_audio_file'][0] : null;
 
   const inputPath = inputFile.path;
@@ -184,16 +186,20 @@ app.post('/process/', upload.fields([
 
     args.push(outputFilename);
 
-    console.log(`Running FFmpeg: ${ffmpegPath} ${args.join(' ')}`);
+    console.log(`FFmpeg cmd: ${ffmpegPath} ${args.join(' ')}`);
     try {
       const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
       const ffmpegErr = result.stderr?.toString() || '';
       const ffmpegOut = result.stdout?.toString() || '';
+      const outputExists = fs.existsSync(outputFilename);
 
-      if (result.status === 0) {
+      console.log(`FFmpeg status=${result.status} outputExists=${outputExists}`);
+      if (ffmpegErr) console.log('FFmpeg stderr:', ffmpegErr.slice(-1000));
+
+      if (result.status === 0 && outputExists) {
         generatedFiles.push(outputFilename);
       } else {
-        lastFfmpegError = `status=${result.status} err=${ffmpegErr || ffmpegOut}`;
+        lastFfmpegError = `status=${result.status} outputExists=${outputExists} err=${ffmpegErr.slice(-500) || ffmpegOut.slice(-500)}`;
         console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
       }
     } catch (e) {
