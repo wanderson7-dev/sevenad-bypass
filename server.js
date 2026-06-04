@@ -106,18 +106,23 @@ app.post('/process/', upload.fields([
     const extraInputs = useHidden ? ['-i', hiddenAudioPath] : [];
 
     if (useHidden) {
-      // Áudio fantasma: frequências acima de 14kHz, volume muito baixo → inaudível para humano
+      // Áudio fantasma na faixa audível (fala: 300Hz–5kHz) a volume baixo.
+      // Humano ouve como "barulho de fundo suave"; IA de transcrição capta e se confunde.
       let mainChain = '[0:a]';
+      const mainFilters = [];
       if (settings.do_uniqueize && settings.randomize_volume) {
-        mainChain += `volume=${randVolume / 100},`;
+        mainFilters.push(`volume=${randVolume / 100}`);
       }
       if (settings.do_audio_antitranscribe) {
-        mainChain += 'pan=stereo|c0=FL|c1=-1*FR,';
+        mainFilters.push('pan=stereo|c0=FL|c1=-1*FR');
       }
-      mainChain = mainChain.replace(/,$/, '') + '[main_a]';
+      mainChain += (mainFilters.length ? mainFilters.join(',') + ',' : '') + 'aformat=sample_rates=48000[main_a]';
 
-      const hiddenChain = `[1:a]aloop=loop=-1:size=2147483647,atrim=duration=${999999},` +
-        `highpass=f=14000,volume=${vol}[hidden_a]`;
+      // Loop o fantasma para cobrir toda a duração, mantém na faixa de fala (bandpass 300–5000Hz)
+      const hiddenChain =
+        `[1:a]aloop=loop=-1:size=2147483647,` +
+        `bandpass=f=1500:width_type=o:width=4,` +
+        `volume=${vol}[hidden_a]`;
 
       audioFilter = `${mainChain};${hiddenChain};[main_a][hidden_a]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
     } else {
