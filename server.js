@@ -18,6 +18,21 @@ const upload = multer({ dest: '/tmp' });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/health', (req, res) => {
+  try {
+    const result = spawnSync(ffmpegPath, ['-version'], { timeout: 5000 });
+    res.json({
+      ffmpegPath,
+      ok: result.status === 0,
+      version: result.stdout?.toString().split('\n')[0] || '',
+      error: result.stderr?.toString().split('\n')[0] || '',
+      spawnError: result.error?.message || null,
+    });
+  } catch (e) {
+    res.status(500).json({ ffmpegPath, ok: false, error: e.message });
+  }
+});
+
 function parseBool(val) {
   return val === 'true' || val === true;
 }
@@ -170,15 +185,20 @@ app.post('/process/', upload.fields([
     args.push(outputFilename);
 
     console.log(`Running FFmpeg: ${ffmpegPath} ${args.join(' ')}`);
-    const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
-    const ffmpegErr = result.stderr?.toString() || '';
-    const ffmpegOut = result.stdout?.toString() || '';
+    try {
+      const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+      const ffmpegErr = result.stderr?.toString() || '';
+      const ffmpegOut = result.stdout?.toString() || '';
 
-    if (result.status === 0) {
-      generatedFiles.push(outputFilename);
-    } else {
-      console.error(`FFmpeg failed (copy ${i}) status=${result.status}:`, ffmpegErr);
-      lastFfmpegError = ffmpegErr || ffmpegOut || `status ${result.status}`;
+      if (result.status === 0) {
+        generatedFiles.push(outputFilename);
+      } else {
+        lastFfmpegError = `status=${result.status} err=${ffmpegErr || ffmpegOut}`;
+        console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
+      }
+    } catch (e) {
+      lastFfmpegError = `spawnSync exception: ${e.message}`;
+      console.error(`FFmpeg exception (copy ${i}):`, lastFfmpegError);
     }
   }
 
