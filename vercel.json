@@ -1,0 +1,12 @@
+{
+  "functions": {
+    "api/process.js": {
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    { "src": "/process/", "dest": "/api/process" },
+    { "src": "/process",  "dest": "/api/process" },
+    { "src": "/(.*)",     "dest": "/public/$1"    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "sevenad-bypass",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {},
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "ffmpeg-static": "^5.2.0",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "vercel": "^37.0.0"
+  }
+}
