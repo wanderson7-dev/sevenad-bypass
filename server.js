@@ -80,6 +80,7 @@ app.post('/process/', upload.fields([
   }
 
   const generatedFiles = [];
+  let lastFfmpegError = '';
 
   for (let i = 1; i <= numCopies; i++) {
     const randNum = randInt(1000, 9999);
@@ -168,13 +169,16 @@ app.post('/process/', upload.fields([
 
     args.push(outputFilename);
 
-    console.log(`Running FFmpeg copy ${i}...`);
+    console.log(`Running FFmpeg: ${ffmpegPath} ${args.join(' ')}`);
     const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+    const ffmpegErr = result.stderr?.toString() || '';
+    const ffmpegOut = result.stdout?.toString() || '';
 
     if (result.status === 0) {
       generatedFiles.push(outputFilename);
     } else {
-      console.error(`FFmpeg error (copy ${i}):`, result.stderr?.toString());
+      console.error(`FFmpeg failed (copy ${i}) status=${result.status}:`, ffmpegErr);
+      lastFfmpegError = ffmpegErr || ffmpegOut || `status ${result.status}`;
     }
   }
 
@@ -182,7 +186,7 @@ app.post('/process/', upload.fields([
   if (hiddenAudioPath) { try { fs.unlinkSync(hiddenAudioPath); } catch {} }
 
   if (generatedFiles.length === 0) {
-    return res.status(500).json({ error: 'Falha no processamento do vídeo.' });
+    return res.status(500).json({ error: 'Falha no processamento do vídeo.', detail: lastFfmpegError });
   }
 
   const cleanup = () => {
