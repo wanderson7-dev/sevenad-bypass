@@ -5,7 +5,7 @@ const fs = require('fs');
 const archiver = require('archiver');
 const ffmpegPath = require('ffmpeg-static');
 
-export const config = {
+module.exports.config = {
   api: {
     bodyParser: false,
     responseLimit: false,
@@ -40,7 +40,7 @@ function extractAudio(inputPath, outputPath) {
   return result.status === 0;
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
