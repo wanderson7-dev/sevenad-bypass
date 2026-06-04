@@ -167,8 +167,7 @@ app.post('/process/', upload.fields([
     const args = ['-y', '-i', inputPath, ...extraInputs];
 
     if (settings.do_uniqueize) {
-      // -c:v libx264 explícito + só -crf (sem -b:v que conflita com crf no libx264)
-      args.push('-c:v', 'libx264', '-r', '30', '-crf', '28', '-preset', 'veryfast');
+      args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', '-threads', '1', '-r', '30');
     }
 
     if (vfParts.length > 0) {
