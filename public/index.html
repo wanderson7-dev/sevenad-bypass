@@ -512,6 +512,44 @@
             color: var(--success);
         }
 
+        /* Segmented control (posição do bumper) */
+        .seg {
+            display: flex;
+            gap: 0.4rem;
+            flex: 1;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 0.25rem;
+        }
+        .seg-btn {
+            flex: 1;
+            position: relative;
+            text-align: center;
+            padding: 0.45rem 0.4rem;
+            border-radius: 9px;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            cursor: pointer;
+            transition: all 0.25s;
+            user-select: none;
+            white-space: nowrap;
+        }
+        .seg-btn input {
+            position: absolute;
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .seg-btn:hover {
+            color: var(--text-main);
+        }
+        .seg-btn:has(input:checked) {
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            color: #fff;
+            box-shadow: var(--glow);
+        }
+
         /* Responsive */
         @media (max-width: 768px) {
             .grid-layout {
@@ -700,6 +738,59 @@
                         </div>
                     </div>
 
+                    <!-- Image Bumper Card -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom: 0.5rem; border:none; padding:0;">
+                            <h3>
+                                <svg class="icon-small" viewBox="0 0 24 24">
+                                    <path d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM10 12l-2 2.5L6.5 13 4 16h16l-5-6-5 2z"/>
+                                </svg>
+                                Image Bumper
+                            </h3>
+                            <label class="switch">
+                                <input type="checkbox" id="do_image_bumper" name="do_image_bumper">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <p class="option-desc" style="margin-top: 0.75rem; line-height: 1.5;">
+                            Anexa uma imagem ou GIF animado no início e/ou no fim do vídeo. Muda a duração e o hash
+                            para gerar variantes únicas. O início é um flash rápido (1–2 frames); o fim tem a duração que você definir.
+                        </p>
+
+                        <div id="bumperSection" style="margin-top:1.2rem; display:none; flex-direction:column; gap:0.8rem;">
+                            <!-- Dropzone for bumper image -->
+                            <div class="hidden-dropzone" id="bumperDropzone">
+                                <svg viewBox="0 0 24 24" style="width:28px;height:28px;fill:url(#grad1);margin-bottom:0.4rem;">
+                                    <path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/>
+                                </svg>
+                                <span id="bumperDzLabel">Enviar imagem ou GIF (PNG/JPG/GIF)</span>
+                                <input type="file" id="bumperImageInput" name="bumper_image_file" accept="image/*,image/gif" style="display:none;">
+                            </div>
+
+                            <!-- Position selector -->
+                            <div style="display:flex;align-items:center;gap:0.8rem;">
+                                <span class="option-desc" style="white-space:nowrap;">Posição</span>
+                                <div class="seg" id="bumperPosSeg">
+                                    <label class="seg-btn"><input type="radio" name="bumper_position" value="start"><span>Só início</span></label>
+                                    <label class="seg-btn"><input type="radio" name="bumper_position" value="end"><span>Só fim</span></label>
+                                    <label class="seg-btn"><input type="radio" name="bumper_position" value="both" checked><span>Ambos</span></label>
+                                </div>
+                            </div>
+
+                            <!-- End duration slider (only when 'end' or 'both') -->
+                            <div id="bumperEndRow" style="display:flex;align-items:center;gap:0.8rem;">
+                                <span class="option-desc" style="white-space:nowrap;">Duração no fim</span>
+                                <input type="range" id="bumperEndSlider" min="1" max="180" step="1" value="3"
+                                    style="flex:1;accent-color:var(--primary);">
+                                <span id="bumperEndVal" style="font-size:0.85rem;color:var(--text-muted);min-width:48px;">3s</span>
+                            </div>
+                            <input type="hidden" name="bumper_end_seconds" id="bumperEndInput" value="3">
+                            <p class="option-desc" style="font-size:0.75rem;">
+                                Início: flash automático de 1–2 frames (~33–66ms). Fim: de 1s até 3min.
+                            </p>
+                        </div>
+                    </div>
+
                 </div>
             </div>
 
@@ -820,6 +911,65 @@
         hiddenVolSlider.addEventListener('input', () => {
             hiddenVolVal.textContent = Math.round(hiddenVolSlider.value * 100) + '%';
         });
+
+        // Image Bumper toggle
+        const bumperToggle = document.getElementById('do_image_bumper');
+        const bumperSection = document.getElementById('bumperSection');
+        const bumperDropzone = document.getElementById('bumperDropzone');
+        const bumperInput = document.getElementById('bumperImageInput');
+        const bumperDzLabel = document.getElementById('bumperDzLabel');
+        const bumperEndSlider = document.getElementById('bumperEndSlider');
+        const bumperEndVal = document.getElementById('bumperEndVal');
+        const bumperEndInput = document.getElementById('bumperEndInput');
+
+        bumperToggle.addEventListener('change', () => {
+            bumperSection.style.display = bumperToggle.checked ? 'flex' : 'none';
+        });
+
+        bumperDropzone.addEventListener('click', () => bumperInput.click());
+        bumperDropzone.addEventListener('dragover', (e) => { e.preventDefault(); bumperDropzone.classList.add('dragover'); });
+        bumperDropzone.addEventListener('dragleave', () => bumperDropzone.classList.remove('dragover'));
+        bumperDropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            bumperDropzone.classList.remove('dragover');
+            if (e.dataTransfer.files[0]) setBumperFile(e.dataTransfer.files[0]);
+        });
+        bumperInput.addEventListener('change', (e) => {
+            if (e.target.files[0]) setBumperFile(e.target.files[0]);
+        });
+        function setBumperFile(file) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            bumperInput.files = dt.files;
+            bumperDzLabel.textContent = `✓ ${file.name}`;
+            bumperDropzone.classList.add('has-file');
+        }
+
+        function fmtDur(s) {
+            s = parseInt(s);
+            if (s < 60) return s + 's';
+            const m = Math.floor(s / 60), r = s % 60;
+            return r ? `${m}m${r}s` : `${m}m`;
+        }
+        bumperEndSlider.addEventListener('input', () => {
+            bumperEndVal.textContent = fmtDur(bumperEndSlider.value);
+            bumperEndInput.value = bumperEndSlider.value;
+        });
+        // Sincroniza label + input escondido com o valor atual do slider no load
+        // (evita divergência caso o navegador restaure um valor do slider)
+        bumperEndVal.textContent = fmtDur(bumperEndSlider.value);
+        bumperEndInput.value = bumperEndSlider.value;
+
+        // Mostra/esconde "Duração no fim" conforme a posição escolhida
+        const bumperEndRow = document.getElementById('bumperEndRow');
+        function syncBumperPos() {
+            const pos = document.querySelector('input[name="bumper_position"]:checked').value;
+            bumperEndRow.style.display = (pos === 'start') ? 'none' : 'flex';
+        }
+        document.querySelectorAll('input[name="bumper_position"]').forEach(r => {
+            r.addEventListener('change', syncBumperPos);
+        });
+        syncBumperPos();
 
         // Form Submit handling
         form.addEventListener('submit', async (e) => {

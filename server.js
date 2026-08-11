@@ -51,9 +51,76 @@ function extractAudio(inputPath, outputPath) {
   return result.status === 0;
 }
 
+// Anexa uma imagem (do usuário) no início e/ou no fim do vídeo.
+// position: 'start' | 'end' | 'both'. startDur/endDur em segundos.
+// A imagem é escalada para casar com a resolução do vídeo (scale com input de
+// referência: rw/rh) e áudio silencioso (anullsrc) preenche os trechos adicionados.
+function addImageBumper(inputPath, imagePath, position, startDur, endDur, outputPath, isGif) {
+  const wantStart = position === 'start' || position === 'both';
+  const wantEnd   = position === 'end'   || position === 'both';
+
+  // GIF animado: -ignore_loop 0 repete o gif; imagem estática: -loop 1 congela o frame.
+  const imgInput = (dur) => isGif
+    ? ['-ignore_loop', '0', '-t', String(dur), '-i', imagePath]
+    : ['-loop', '1', '-t', String(dur), '-i', imagePath];
+
+  // Monta inputs dinamicamente e guarda os índices de cada um
+  const args = ['-y', '-i', inputPath];
+  let idx = 1;
+  let startImgIdx, endImgIdx, startSilIdx, endSilIdx;
+  if (wantStart) { args.push(...imgInput(startDur)); startImgIdx = idx++; }
+  if (wantEnd)   { args.push(...imgInput(endDur));   endImgIdx = idx++; }
+  if (wantStart) { args.push('-f', 'lavfi', '-t', String(startDur), '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000'); startSilIdx = idx++; }
+  if (wantEnd)   { args.push('-f', 'lavfi', '-t', String(endDur),   '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000'); endSilIdx = idx++; }
+
+  const f = [];
+  // Vídeo/áudio principal normalizados
+  f.push(`[0:v]fps=30,setsar=1,format=yuv420p[mv]`);
+  f.push(`[0:a]aformat=sample_rates=48000:channel_layouts=stereo[ma]`);
+
+  const order = []; // sequência final [video, audio] para o concat
+  if (wantStart) {
+    f.push(`[${startImgIdx}:v][0:v]scale=rw:rh[imgs]`);
+    f.push(`[imgs]fps=30,setsar=1,format=yuv420p[sv]`);
+    f.push(`[${startSilIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo[sa]`);
+    order.push(['sv', 'sa']);
+  }
+  order.push(['mv', 'ma']);
+  if (wantEnd) {
+    f.push(`[${endImgIdx}:v][0:v]scale=rw:rh[imge]`);
+    f.push(`[imge]fps=30,setsar=1,format=yuv420p[ev]`);
+    f.push(`[${endSilIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo[ea]`);
+    order.push(['ev', 'ea']);
+  }
+
+  const n = order.length;
+  const concatIn = order.map(([v, a]) => `[${v}][${a}]`).join('');
+  f.push(`${concatIn}concat=n=${n}:v=1:a=1[outv][outa]`);
+
+  args.push(
+    '-filter_complex', f.join(';'),
+    '-map', '[outv]', '-map', '[outa]',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30', '-threads', '1', '-r', '30',
+    '-c:a', 'aac', '-b:a', '128k',
+    outputPath,
+  );
+
+  console.log(`FFmpeg bumper cmd: ${ffmpegPath} ${args.join(' ')}`);
+  const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+  const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000;
+  if (!ok && result.stderr) console.log('Bumper stderr (last 500):', result.stderr.toString().slice(-500));
+  return {
+    ok,
+    err: result.stderr?.toString().slice(-300) || '',
+    status: result.status,
+    signal: result.signal,
+  };
+}
+
 app.post('/process/', upload.fields([
   { name: 'file', maxCount: 1 },
-  { name: 'hidden_audio_file', maxCount: 1 }
+  { name: 'hidden_audio_file', maxCount: 1 },
+  { name: 'bumper_image_file', maxCount: 1 }
 ]), async (req, res) => {
   if (!req.files || !req.files['file']) {
     return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
@@ -70,6 +137,9 @@ app.post('/process/', upload.fields([
     randomize_brightness:    parseBool(body.randomize_brightness),
     do_hidden_audio:         parseBool(body.do_hidden_audio),
     hidden_audio_volume:     parseFloat(body.hidden_audio_volume) || 0.03,
+    do_image_bumper:         parseBool(body.do_image_bumper),
+    bumper_position:         ['start', 'end', 'both'].includes(body.bumper_position) ? body.bumper_position : 'both',
+    bumper_end_seconds:      Math.min(180, Math.max(1, parseInt(body.bumper_end_seconds) || 3)),
   };
 
   console.log('settings:', JSON.stringify(settings));
@@ -77,6 +147,11 @@ app.post('/process/', upload.fields([
   const inputFile = req.files['file'][0];
   console.log('inputFile:', inputFile?.originalname, inputFile?.size, inputFile?.path, 'exists:', fs.existsSync(inputFile?.path));
   const hiddenFile = req.files['hidden_audio_file'] ? req.files['hidden_audio_file'][0] : null;
+  const bumperFile = req.files['bumper_image_file'] ? req.files['bumper_image_file'][0] : null;
+  const bumperImagePath = (settings.do_image_bumper && bumperFile) ? bumperFile.path : null;
+  const bumperIsGif = !!bumperFile && (
+    /gif/i.test(bumperFile.mimetype || '') || /\.gif$/i.test(bumperFile.originalname || '')
+  );
 
   const inputPath = inputFile.path;
   const originalName = inputFile.originalname || 'video.mp4';
@@ -101,7 +176,13 @@ app.post('/process/', upload.fields([
 
   for (let i = 1; i <= numCopies; i++) {
     const randNum = randInt(1000, 9999);
-    const outputFilename = `/tmp/${randPrefix}_${name}_${i}_${randNum}${ext}`;
+    const useBumper = settings.do_image_bumper && bumperImagePath;
+    const finalOutput = `/tmp/${randPrefix}_${name}_${i}_${randNum}${ext}`;
+    // Se o bumper estiver ativo, o pass 1 grava num arquivo intermediário e o
+    // pass 2 (addImageBumper) gera o arquivo final.
+    const outputFilename = useBumper
+      ? `/tmp/${randPrefix}_${name}_${i}_${randNum}_p1${ext}`
+      : finalOutput;
 
     const vfParts = [];
     let randVolume = 100;
@@ -202,7 +283,22 @@ app.post('/process/', upload.fields([
       console.log(`FFmpeg outputSize=${outputSize} success=${success}`);
 
       if (success) {
-        generatedFiles.push(outputFilename);
+        if (useBumper) {
+          const startDur = (randInt(1, 2) / 30).toFixed(3); // 1–2 frames a 30fps
+          const b = addImageBumper(outputFilename, bumperImagePath, settings.bumper_position, startDur, settings.bumper_end_seconds, finalOutput, bumperIsGif);
+          if (b.ok) {
+            try { fs.unlinkSync(outputFilename); } catch {}
+            generatedFiles.push(finalOutput);
+          } else {
+            // Fallback: se o bumper falhar, ainda entrega o vídeo processado
+            lastFfmpegError = `bumper: status=${b.status} signal=${b.signal} err=${b.err}`;
+            console.error(`Bumper failed (copy ${i}):`, lastFfmpegError);
+            try { if (fs.existsSync(finalOutput)) fs.unlinkSync(finalOutput); } catch {}
+            generatedFiles.push(outputFilename);
+          }
+        } else {
+          generatedFiles.push(outputFilename);
+        }
       } else {
         lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} size=${outputSize} err=${ffmpegErr.slice(-300) || ffmpegOut.slice(-300)}`;
         console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
@@ -215,6 +311,7 @@ app.post('/process/', upload.fields([
 
   try { fs.unlinkSync(inputPath); } catch {}
   if (hiddenAudioPath) { try { fs.unlinkSync(hiddenAudioPath); } catch {} }
+  if (bumperFile) { try { fs.unlinkSync(bumperFile.path); } catch {} }
 
   if (generatedFiles.length === 0) {
     return res.status(500).json({ error: 'Falha no processamento do vídeo.', detail: lastFfmpegError });
