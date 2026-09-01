@@ -602,6 +602,9 @@
             </div>
 
             <div class="grid-layout">
+                <!-- Left Column (Video filters) -->
+                <div style="display: flex; flex-direction: column; gap: 2rem;">
+
                 <!-- Video Uniqueization Settings -->
                 <div class="card">
                     <div class="card-header">
@@ -670,6 +673,68 @@
                             </label>
                         </div>
                     </div>
+                </div>
+
+                <!-- Halftone Card -->
+                <div class="card">
+                    <div class="card-header" style="margin-bottom: 0.5rem; border:none; padding:0;">
+                        <h3>
+                            <svg class="icon-small" viewBox="0 0 24 24">
+                                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-4 6a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm8 0a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm-8 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm4-2a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm4 2a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
+                            </svg>
+                            Halftone
+                        </h3>
+                        <label class="switch">
+                            <input type="checkbox" id="do_halftone" name="do_halftone">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <p class="option-desc" style="margin-top: 0.75rem; line-height: 1.5;">
+                        Sobrepõe uma trama de pontos (meio-tom) no vídeo, tipo impressão/pôster. Mantém as cores e é rápido. Muda o hash.
+                    </p>
+                    <div id="halftoneSection" style="margin-top:1.2rem; display:none; flex-direction:column; gap:0.6rem;">
+                        <div style="display:flex;align-items:center;gap:0.8rem;">
+                            <span class="option-desc" style="white-space:nowrap;">Intensidade</span>
+                            <input type="range" id="halftoneOpacitySlider" name="halftone_opacity" min="5" max="100" step="5" value="50"
+                                style="flex:1;accent-color:var(--primary);">
+                            <span id="halftoneOpacityVal" style="font-size:0.85rem;color:var(--text-muted);min-width:44px;">50%</span>
+                        </div>
+                        <p class="option-desc" style="font-size:0.75rem;">
+                            Pontos fixos (~6px). Menor = pontos sutis; maior = pontos bem marcados. Processamento rápido.
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Ruído (CapCut) Card -->
+                <div class="card">
+                    <div class="card-header" style="margin-bottom: 0.5rem; border:none; padding:0;">
+                        <h3>
+                            <svg class="icon-small" viewBox="0 0 24 24">
+                                <path d="M4 4h2v2H4V4zm4 0h2v2H8V4zm4 0h2v2h-2V4zm4 0h2v2h-2V4zM4 8h2v2H4V8zm8 0h2v2h-2V8zm6 0h2v2h-2V8zM4 12h2v2H4v-2zm4 0h2v2H8v-2zm8 0h2v2h-2v-2zM4 16h2v2H4v-2zm6 0h2v2h-2v-2zm4 0h2v2h-2v-2zm4 0h2v2h-2v-2z"/>
+                            </svg>
+                            Ruído - (CapCut)
+                        </h3>
+                        <label class="switch">
+                            <input type="checkbox" id="do_capcut_noise" name="do_capcut_noise">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <p class="option-desc" style="margin-top: 0.75rem; line-height: 1.5;">
+                        Grão de filme animado sobreposto ao vídeo, no estilo do efeito "Ruído" do CapCut. Dá textura e muda o hash.
+                    </p>
+                    <div id="capcutNoiseSection" style="margin-top:1.2rem; display:none; flex-direction:column; gap:0.6rem;">
+                        <div style="display:flex;align-items:center;gap:0.8rem;">
+                            <span class="option-desc" style="white-space:nowrap;">Intensidade</span>
+                            <input type="range" id="capcutNoiseSlider" name="capcut_noise_strength" min="5" max="60" step="1" value="15"
+                                style="flex:1;accent-color:var(--primary);">
+                            <span id="capcutNoiseVal" style="font-size:0.85rem;color:var(--text-muted);min-width:32px;">15</span>
+                        </div>
+                        <p class="option-desc" style="font-size:0.75rem;">
+                            Menor = grão sutil. Maior = grão bem visível. Padrão do CapCut ≈ 20.
+                        </p>
+                    </div>
+                </div>
+
                 </div>
 
                 <!-- Right Column (Audio & Generation) -->
@@ -794,6 +859,15 @@
                 </div>
             </div>
 
+            <!-- Output format selector -->
+            <div style="display:flex;align-items:center;justify-content:center;gap:0.8rem;margin-bottom:1.2rem;">
+                <span class="option-desc" style="white-space:nowrap;">Formato de saída</span>
+                <div class="seg" style="max-width:240px;flex:none;">
+                    <label class="seg-btn" style="padding:0.45rem 1.4rem;"><input type="radio" name="output_format" value="mp4" checked><span>MP4</span></label>
+                    <label class="seg-btn" style="padding:0.45rem 1.4rem;"><input type="radio" name="output_format" value="mov"><span>MOV</span></label>
+                </div>
+            </div>
+
             <button type="submit" class="btn-magic" id="submitBtn" disabled>
                 <svg viewBox="0 0 24 24">
                     <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
@@ -910,6 +984,30 @@
 
         hiddenVolSlider.addEventListener('input', () => {
             hiddenVolVal.textContent = Math.round(hiddenVolSlider.value * 100) + '%';
+        });
+
+        // Halftone toggle + dot size
+        const halftoneToggle = document.getElementById('do_halftone');
+        const halftoneSection = document.getElementById('halftoneSection');
+        const halftoneOpacitySlider = document.getElementById('halftoneOpacitySlider');
+        const halftoneOpacityVal = document.getElementById('halftoneOpacityVal');
+        halftoneToggle.addEventListener('change', () => {
+            halftoneSection.style.display = halftoneToggle.checked ? 'flex' : 'none';
+        });
+        halftoneOpacitySlider.addEventListener('input', () => {
+            halftoneOpacityVal.textContent = halftoneOpacitySlider.value + '%';
+        });
+
+        // Ruído (CapCut) toggle + intensity
+        const capcutToggle = document.getElementById('do_capcut_noise');
+        const capcutSection = document.getElementById('capcutNoiseSection');
+        const capcutSlider = document.getElementById('capcutNoiseSlider');
+        const capcutVal = document.getElementById('capcutNoiseVal');
+        capcutToggle.addEventListener('change', () => {
+            capcutSection.style.display = capcutToggle.checked ? 'flex' : 'none';
+        });
+        capcutSlider.addEventListener('input', () => {
+            capcutVal.textContent = capcutSlider.value;
         });
 
         // Image Bumper toggle
