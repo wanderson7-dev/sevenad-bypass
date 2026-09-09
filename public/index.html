@@ -760,6 +760,30 @@
                         </p>
                     </div>
 
+                    <!-- Anti-transcript Inteligente (IA) Card -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom: 0.5rem; border:none; padding:0;">
+                            <h3>
+                                <svg class="icon-small" viewBox="0 0 24 24">
+                                    <path d="M12 2a5 5 0 0 0-5 5v3a5 5 0 0 0 10 0V7a5 5 0 0 0-5-5zm7 8a7 7 0 0 1-6 6.92V20h3v2H8v-2h3v-3.08A7 7 0 0 1 5 10h2a5 5 0 0 0 10 0h2z"/>
+                                </svg>
+                                Anti-transcript Inteligente <span style="font-size:0.7rem;color:var(--primary);">IA</span>
+                            </h3>
+                            <label class="switch">
+                                <input type="checkbox" id="do_smart_antitranscribe" name="do_smart_antitranscribe">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <p class="option-desc" style="margin-top: 1rem; line-height: 1.5;">
+                            Transcreve a fala (AssemblyAI), o Claude acha as palavras sensíveis (que reprovam anúncio)
+                            e o anti-transcript é aplicado <b>só nesses trechos</b>. Humano ouve tudo; a IA "perde" as palavras.
+                        </p>
+                        <p class="option-desc" style="font-size:0.72rem;margin-top:0.6rem;">
+                            ⚠️ Um pouco mais lento (transcreve o áudio). Requer chaves AssemblyAI + Anthropic no servidor.
+                        </p>
+                        <div id="smartResult" style="display:none;margin-top:0.8rem;padding:0.6rem 0.8rem;border-radius:10px;background:rgba(0,136,255,0.08);border:1px solid var(--glass-border);font-size:0.8rem;"></div>
+                    </div>
+
                     <!-- Hidden AI Audio Card -->
                     <div class="card">
                         <div class="card-header" style="margin-bottom: 0.5rem; border:none; padding:0;">
@@ -1080,6 +1104,9 @@
                 formData.set(cb.name, cb.checked ? 'true' : 'false');
             });
 
+            const smartOn = document.getElementById('do_smart_antitranscribe').checked;
+            document.querySelector('.loader-text').textContent = smartOn ? 'Transcrevendo e analisando com IA...' : 'Applying Neural Filters...';
+            document.querySelector('.loader-sub').textContent = smartOn ? 'Pode levar 1–2 min na 1ª vez (baixa o modelo Whisper).' : 'FFmpeg engine is compiling the frames.';
             loader.classList.add('active');
 
             try {
@@ -1091,6 +1118,21 @@
                 if (!response.ok) {
                     const errData = await response.json().catch(() => ({}));
                     throw new Error(errData.detail || errData.error || 'Falha no processamento.');
+                }
+
+                // Palavras sensíveis detectadas (anti-transcript inteligente)
+                const smartBox = document.getElementById('smartResult');
+                const sw = response.headers.get('X-Sensitive-Words');
+                if (sw && smartBox) {
+                    let words = [];
+                    try { words = JSON.parse(decodeURIComponent(sw)); } catch {}
+                    if (words.length) {
+                        smartBox.innerHTML = `🔇 Anti-transcript aplicado em <b>${words.length}</b> palavra(s): ` +
+                            words.map(w => `<span style="color:var(--primary)">${w}</span>`).join(', ');
+                    } else {
+                        smartBox.innerHTML = '✓ Nenhuma palavra sensível encontrada pela IA.';
+                    }
+                    smartBox.style.display = 'block';
                 }
 
                 // Extract filename

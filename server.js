@@ -1,9 +1,27 @@
+// Carrega variáveis de um arquivo .env local (NÃO versionado). No Railway,
+// as variáveis vêm do painel — este bloco simplesmente não faz nada lá.
+(() => {
+  try {
+    const fsx = require('fs'), px = require('path');
+    const envPath = px.join(__dirname, '.env');
+    if (!fsx.existsSync(envPath)) return;
+    for (const line of fsx.readFileSync(envPath, 'utf8').split('\n')) {
+      const m = line.match(/^\s*([\w.]+)\s*=\s*(.*)\s*$/);
+      if (!m || (m[1] in process.env)) continue;
+      let v = m[2].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      process.env[m[1]] = v;
+    }
+  } catch {}
+})();
+
 const express = require('express');
 const multer = require('multer');
 const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const archiver = require('archiver');
+const { analyzeSensitiveRanges } = require('./smart');
 // Usa ffmpeg do sistema (Docker/Railway) se disponível, senão usa ffmpeg-static (local)
 const { execSync } = require('child_process');
 let ffmpegPath;
@@ -182,6 +200,39 @@ function applyHalftoneOverlay(inputPath, opacity, outputPath, tmpPrefix) {
   };
 }
 
+// Extrai o áudio como um m4a mono 16kHz compacto (pra enviar à AssemblyAI).
+function extractAudioForStt(inputPath, outPath) {
+  const r = spawnSync(ffmpegPath, [
+    '-y', '-i', inputPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'aac', '-b:a', '64k', outPath
+  ], { timeout: 120000 });
+  return r.status === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
+}
+
+// Anti-transcript SELETIVO: inverte a fase do canal direito só nos intervalos
+// (palavras sensíveis). Assim o downmix mono da IA cancela só nesses trechos,
+// enquanto o humano ouve tudo normalmente. Vídeo é copiado (sem re-encode).
+function applySmartAntiTranscribe(inputPath, ranges, outputPath) {
+  const enable = ranges
+    .map(([s, e]) => `between(t,${s.toFixed(3)},${e.toFixed(3)})`)
+    .join('+');
+  const fc =
+    `[0:a]aformat=channel_layouts=stereo,channelsplit=channel_layout=stereo[l][r];` +
+    `[r]volume=volume=-1:enable='${enable}'[ri];` +
+    `[l][ri]join=inputs=2:channel_layout=stereo[a]`;
+  const args = [
+    '-y', '-i', inputPath,
+    '-filter_complex', fc,
+    '-map', '0:v', '-map', '[a]',
+    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
+    outputPath,
+  ];
+  console.log(`FFmpeg smart-anti cmd: ${ffmpegPath} ${args.join(' ')}`);
+  const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+  const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000;
+  if (!ok && result.stderr) console.log('Smart-anti stderr (last 500):', result.stderr.toString().slice(-500));
+  return { ok, err: result.stderr?.toString().slice(-300) || '', status: result.status, signal: result.signal };
+}
+
 app.post('/process/', upload.fields([
   { name: 'file', maxCount: 1 },
   { name: 'hidden_audio_file', maxCount: 1 },
@@ -209,6 +260,7 @@ app.post('/process/', upload.fields([
     halftone_opacity:        Math.min(100, Math.max(5, parseInt(body.halftone_opacity) || 50)),
     do_capcut_noise:         parseBool(body.do_capcut_noise),
     capcut_noise_strength:   Math.min(100, Math.max(1, parseInt(body.capcut_noise_strength) || 15)),
+    do_smart_antitranscribe: parseBool(body.do_smart_antitranscribe),
     output_format:           body.output_format === 'mov' ? 'mov' : 'mp4',
   };
 
@@ -242,6 +294,29 @@ app.post('/process/', upload.fields([
     try { fs.unlinkSync(hiddenFile.path); } catch {}
   }
 
+  // Anti-transcript inteligente: transcreve (Whisper local) -> Claude acha palavras
+  // sensíveis -> intervalos de tempo. Feito UMA vez (vale para todas as cópias).
+  let smartRanges = [];
+  let smartWords = [];
+  if (settings.do_smart_antitranscribe) {
+    const audioStt = `/tmp/${randPrefix}_stt.m4a`;
+    try {
+      if (extractAudioForStt(inputPath, audioStt)) {
+        console.log('smart: transcrevendo (AssemblyAI) + analisando com Claude...');
+        const res = await analyzeSensitiveRanges(audioStt);
+        smartRanges = res.ranges || [];
+        smartWords = res.sensitive || [];
+        console.log(`smart: ${smartWords.length} palavra(s) sensível(is):`, JSON.stringify(smartWords), 'ranges:', JSON.stringify(smartRanges));
+      } else {
+        console.warn('smart: falha ao extrair áudio, ignorando.');
+      }
+    } catch (e) {
+      console.error('smart: análise falhou:', e.message);
+    }
+    try { fs.unlinkSync(audioStt); } catch {}
+  }
+  const useSmart = settings.do_smart_antitranscribe && smartRanges.length > 0;
+
   const generatedFiles = [];
   let lastFfmpegError = '';
 
@@ -250,7 +325,7 @@ app.post('/process/', upload.fields([
     const base = `/tmp/${randPrefix}_${name}_${i}_${randNum}`;
     const useHalftone = settings.do_halftone;
     const useBumper = settings.do_image_bumper && bumperImagePath;
-    const needsPost = useHalftone || useBumper; // passes extras após o pass 1
+    const needsPost = useSmart || useHalftone || useBumper; // passes extras após o pass 1
     const finalOutput = `${base}${outExt}`;
     // Se houver passes extras (halftone/bumper), o pass 1 grava num intermediário.
     const outputFilename = needsPost ? `${base}_p1${outExt}` : finalOutput;
@@ -297,7 +372,7 @@ app.post('/process/', upload.fields([
       if (settings.do_uniqueize && settings.randomize_volume) {
         mainFilters.push(`volume=${randVolume / 100}`);
       }
-      if (settings.do_audio_antitranscribe) {
+      if (settings.do_audio_antitranscribe && !useSmart) {
         mainFilters.push('pan=stereo|c0=FL|c1=-1*FR');
       }
       mainChain += (mainFilters.length ? mainFilters.join(',') + ',' : '') + 'aformat=sample_rates=48000[main_a]';
@@ -314,7 +389,7 @@ app.post('/process/', upload.fields([
       if (settings.do_uniqueize && settings.randomize_volume) {
         afParts.push(`volume=${randVolume / 100}`);
       }
-      if (settings.do_audio_antitranscribe) {
+      if (settings.do_audio_antitranscribe && !useSmart) {
         afParts.push('pan=stereo|c0=FL|c1=-1*FR');
       }
       if (afParts.length > 0) {
@@ -361,40 +436,63 @@ app.post('/process/', upload.fields([
       console.log(`FFmpeg outputSize=${outputSize} success=${success}`);
 
       if (success) {
-        // Cadeia de passes extras: pass1 -> Halftone -> Bumper -> final
+        // Cadeia de passes extras: pass1 -> Smart-anti -> Halftone -> Bumper -> final
+        // Cada passe grava num arquivo próprio; no fim renomeamos o sobrevivente.
         let curFile = outputFilename;
+
+        // Passe Anti-transcript inteligente (inversão só nos trechos sensíveis)
+        if (useSmart) {
+          const t = `${base}_ps${outExt}`;
+          const s = applySmartAntiTranscribe(curFile, smartRanges, t);
+          if (s.ok) {
+            try { fs.unlinkSync(curFile); } catch {}
+            curFile = t;
+          } else {
+            lastFfmpegError = `smart: status=${s.status} signal=${s.signal} err=${s.err}`;
+            console.error(`Smart-anti failed (copy ${i}):`, lastFfmpegError);
+            try { if (fs.existsSync(t)) fs.unlinkSync(t); } catch {}
+          }
+        }
 
         // Passe Halftone (overlay de textura de pontos)
         if (useHalftone) {
-          const htTarget = useBumper ? `${base}_p2${outExt}` : finalOutput;
-          const ht = applyHalftoneOverlay(curFile, settings.halftone_opacity, htTarget, base);
+          const t = `${base}_ph${outExt}`;
+          const ht = applyHalftoneOverlay(curFile, settings.halftone_opacity, t, base);
           if (ht.ok) {
             try { fs.unlinkSync(curFile); } catch {}
-            curFile = htTarget;
+            curFile = t;
           } else {
-            // Fallback: se o halftone falhar, segue com o vídeo processado sem ele
             lastFfmpegError = `halftone: status=${ht.status} signal=${ht.signal} err=${ht.err}`;
             console.error(`Halftone failed (copy ${i}):`, lastFfmpegError);
-            try { if (fs.existsSync(htTarget) && htTarget !== curFile) fs.unlinkSync(htTarget); } catch {}
+            try { if (fs.existsSync(t)) fs.unlinkSync(t); } catch {}
           }
         }
 
         // Passe Bumper (imagem/GIF no início/fim)
         if (useBumper) {
+          const t = `${base}_pb${outExt}`;
           const startDur = (randInt(1, 2) / 30).toFixed(3); // 1–2 frames a 30fps
-          const b = addImageBumper(curFile, bumperImagePath, settings.bumper_position, startDur, settings.bumper_end_seconds, finalOutput, bumperIsGif);
+          const b = addImageBumper(curFile, bumperImagePath, settings.bumper_position, startDur, settings.bumper_end_seconds, t, bumperIsGif);
           if (b.ok) {
             try { fs.unlinkSync(curFile); } catch {}
-            curFile = finalOutput;
+            curFile = t;
           } else {
-            // Fallback: se o bumper falhar, ainda entrega o vídeo processado
             lastFfmpegError = `bumper: status=${b.status} signal=${b.signal} err=${b.err}`;
             console.error(`Bumper failed (copy ${i}):`, lastFfmpegError);
-            try { if (fs.existsSync(finalOutput) && finalOutput !== curFile) fs.unlinkSync(finalOutput); } catch {}
+            try { if (fs.existsSync(t)) fs.unlinkSync(t); } catch {}
           }
         }
 
-        generatedFiles.push(curFile);
+        // Renomeia o sobrevivente para o nome final
+        if (curFile !== finalOutput) {
+          try {
+            if (fs.existsSync(finalOutput)) fs.unlinkSync(finalOutput);
+            fs.renameSync(curFile, finalOutput);
+          } catch (e) {
+            console.error('rename final falhou:', e.message);
+          }
+        }
+        generatedFiles.push(finalOutput);
       } else {
         lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} size=${outputSize} err=${ffmpegErr.slice(-300) || ffmpegOut.slice(-300)}`;
         console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
@@ -416,6 +514,12 @@ app.post('/process/', upload.fields([
   const cleanup = () => {
     generatedFiles.forEach((f) => { try { fs.unlinkSync(f); } catch {} });
   };
+
+  // Expõe as palavras sensíveis detectadas (pra UI mostrar o que foi "mutado")
+  if (settings.do_smart_antitranscribe) {
+    res.setHeader('Access-Control-Expose-Headers', 'X-Sensitive-Words');
+    res.setHeader('X-Sensitive-Words', encodeURIComponent(JSON.stringify(smartWords)));
+  }
 
   if (generatedFiles.length === 1) {
     const filePath = generatedFiles[0];
