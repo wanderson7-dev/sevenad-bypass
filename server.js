@@ -17,13 +17,13 @@
 
 const express = require('express');
 const multer = require('multer');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const archiver = require('archiver');
 const { analyzeSensitiveRanges } = require('./smart');
 // Usa ffmpeg do sistema (Docker/Railway) se disponível, senão usa ffmpeg-static (local)
-const { execSync } = require('child_process');
 let ffmpegPath;
 try {
   ffmpegPath = execSync('which ffmpeg').toString().trim();
@@ -66,21 +66,107 @@ function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+// Executa o FFmpeg de forma assíncrona e relata o progresso através do tempo
+// processado. Retorna uma Promise com { status, signal, err }.
+//  - durationSec: duração do vídeo (para calcular a fração 0..1). Se ausente,
+//    não há relato de progresso (só o "pulo" ao concluir).
+//  - onProgress(frac): chamado com a fração (0..1) do passe atual.
+function runFfmpeg(args, opts = {}) {
+  const { durationSec, onProgress, timeout = 600000 } = opts;
+  return new Promise((resolve) => {
+    // Injeta -nostats -progress pipe:1 (logo após o -y global, se houver).
+    const full = args.slice();
+    const insertAt = full[0] === '-y' ? 1 : 0;
+    full.splice(insertAt, 0, '-nostats', '-progress', 'pipe:1');
+
+    let child;
+    try {
+      child = spawn(ffmpegPath, full);
+    } catch (e) {
+      return resolve({ status: null, signal: null, err: e.message });
+    }
+
+    let errTail = '';
+    let outBuf = '';
+    let killed = false;
+    const timer = setTimeout(() => { killed = true; try { child.kill('SIGKILL'); } catch {} }, timeout);
+
+    child.stdout.on('data', (d) => {
+      outBuf += d.toString();
+      let idx;
+      while ((idx = outBuf.indexOf('\n')) >= 0) {
+        const line = outBuf.slice(0, idx);
+        outBuf = outBuf.slice(idx + 1);
+        if (!onProgress || !durationSec) continue;
+        let us = null;
+        let m = line.match(/^out_time_us=(\d+)/);
+        if (m) us = Number(m[1]);
+        else if ((m = line.match(/^out_time_ms=(\d+)/))) us = Number(m[1]) * 1000;
+        if (us != null) {
+          let f = us / 1e6 / durationSec;
+          if (!isFinite(f) || f < 0) f = 0;
+          if (f > 0.999) f = 0.999;
+          onProgress(f);
+        }
+      }
+    });
+    child.stderr.on('data', (d) => { errTail = (errTail + d.toString()).slice(-4000); });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ status: null, signal: null, err: e.message }); });
+    child.on('close', (status, signal) => {
+      clearTimeout(timer);
+      if (onProgress && durationSec) onProgress(0.999);
+      resolve({
+        status,
+        signal: killed ? 'SIGKILL(timeout)' : signal,
+        err: errTail.slice(-300),
+      });
+    });
+  });
+}
+
+// Descobre a duração (em segundos) de um mídia. Tenta ffprobe; se indisponível,
+// faz o parse do stderr do `ffmpeg -i` (sempre funciona, inclusive com ffmpeg-static).
+function getDurationSec(input) {
+  return new Promise((resolve) => {
+    if (ffprobePath) {
+      try {
+        const r = spawnSync(ffprobePath, [
+          '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', input,
+        ], { timeout: 15000 });
+        const d = parseFloat((r.stdout?.toString() || '').trim());
+        if (d > 0) return resolve(d);
+      } catch {}
+    }
+    // Fallback: parse do "Duration: HH:MM:SS.xx" no stderr do ffmpeg.
+    try {
+      const child = spawn(ffmpegPath, ['-i', input]);
+      let err = '';
+      child.stderr.on('data', (d) => { err += d.toString(); });
+      child.on('error', () => resolve(null));
+      child.on('close', () => {
+        const m = err.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (m) return resolve((+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]));
+        resolve(null);
+      });
+    } catch { resolve(null); }
+  });
+}
+
 // Extrai o áudio de um arquivo (vídeo ou áudio) para um arquivo .wav temporário
-function extractAudio(inputPath, outputPath) {
-  const result = spawnSync(ffmpegPath, [
+async function extractAudio(inputPath, outputPath) {
+  const r = await runFfmpeg([
     '-y', '-i', inputPath,
     '-vn', '-acodec', 'pcm_s16le', '-ar', '48000', '-ac', '2',
-    outputPath
-  ], { timeout: 60000 });
-  return result.status === 0;
+    outputPath,
+  ], { timeout: 120000 });
+  return r.status === 0;
 }
 
 // Anexa uma imagem (do usuário) no início e/ou no fim do vídeo.
 // position: 'start' | 'end' | 'both'. startDur/endDur em segundos.
 // A imagem é escalada para casar com a resolução do vídeo (scale com input de
 // referência: rw/rh) e áudio silencioso (anullsrc) preenche os trechos adicionados.
-function addImageBumper(inputPath, imagePath, position, startDur, endDur, outputPath, isGif) {
+async function addImageBumper(inputPath, imagePath, position, startDur, endDur, outputPath, isGif, opts = {}) {
   const wantStart = position === 'start' || position === 'both';
   const wantEnd   = position === 'end'   || position === 'both';
 
@@ -131,15 +217,13 @@ function addImageBumper(inputPath, imagePath, position, startDur, endDur, output
   );
 
   console.log(`FFmpeg bumper cmd: ${ffmpegPath} ${args.join(' ')}`);
-  const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+  const result = await runFfmpeg(args, {
+    durationSec: opts.durationSec ? opts.durationSec + startDur + endDur : undefined,
+    onProgress: opts.onProgress,
+  });
   const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000;
-  if (!ok && result.stderr) console.log('Bumper stderr (last 500):', result.stderr.toString().slice(-500));
-  return {
-    ok,
-    err: result.stderr?.toString().slice(-300) || '',
-    status: result.status,
-    signal: result.signal,
-  };
+  if (!ok && result.err) console.log('Bumper stderr (last 300):', result.err);
+  return { ok, err: result.err || '', status: result.status, signal: result.signal };
 }
 
 // Descobre a resolução (largura/altura) de um vídeo via ffprobe.
@@ -161,7 +245,7 @@ function probeSize(file) {
 // sobrepõe via multiply. Muito mais rápido que geq por frame. A opacidade
 // controla a força dos pontos (5% = bem sutil, 100% = pontos pretos fortes).
 // A cor do vídeo é preservada (multiply por textura neutra).
-function applyHalftoneOverlay(inputPath, opacity, outputPath, tmpPrefix) {
+async function applyHalftoneOverlay(inputPath, opacity, outputPath, tmpPrefix, opts = {}) {
   const size = probeSize(inputPath);
   if (!size) return { ok: false, err: 'ffprobe indisponível ou falhou ao ler a resolução' };
   const { w, h } = size;
@@ -169,13 +253,13 @@ function applyHalftoneOverlay(inputPath, opacity, outputPath, tmpPrefix) {
   // Textura de pontos redondos (anti-aliased) branca com pontos pretos, grade de 6px.
   const texPath = `${tmpPrefix}_httex.png`;
   const S = 6, hc = 3, r = 2.0;
-  const tgen = spawnSync(ffmpegPath, [
+  const tgen = await runFfmpeg([
     '-y', '-f', 'lavfi', '-i', `color=c=white:s=${w}x${h}`, '-frames:v', '1',
     '-vf', `format=gray,geq=lum='255*clip(hypot(mod(X\\,${S})-${hc}\\,mod(Y\\,${S})-${hc})-${r}+0.5\\,0\\,1)'`,
     texPath
   ], { timeout: 60000 });
   if (!fs.existsSync(texPath)) {
-    return { ok: false, err: 'falha ao gerar textura: ' + (tgen.stderr?.toString().slice(-200) || '') };
+    return { ok: false, err: 'falha ao gerar textura: ' + (tgen.err || '') };
   }
 
   const op = (opacity / 100).toFixed(3);
@@ -188,30 +272,25 @@ function applyHalftoneOverlay(inputPath, opacity, outputPath, tmpPrefix) {
     outputPath
   ];
   console.log(`FFmpeg halftone cmd: ${ffmpegPath} ${args.join(' ')}`);
-  const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+  const result = await runFfmpeg(args, { durationSec: opts.durationSec, onProgress: opts.onProgress });
   try { fs.unlinkSync(texPath); } catch {}
   const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000;
-  if (!ok && result.stderr) console.log('Halftone stderr (last 500):', result.stderr.toString().slice(-500));
-  return {
-    ok,
-    err: result.stderr?.toString().slice(-300) || '',
-    status: result.status,
-    signal: result.signal,
-  };
+  if (!ok && result.err) console.log('Halftone stderr (last 300):', result.err);
+  return { ok, err: result.err || '', status: result.status, signal: result.signal };
 }
 
 // Extrai o áudio como um m4a mono 16kHz compacto (pra enviar à AssemblyAI).
-function extractAudioForStt(inputPath, outPath) {
-  const r = spawnSync(ffmpegPath, [
+async function extractAudioForStt(inputPath, outPath, opts = {}) {
+  const r = await runFfmpeg([
     '-y', '-i', inputPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'aac', '-b:a', '64k', outPath
-  ], { timeout: 120000 });
+  ], { timeout: 180000, durationSec: opts.durationSec, onProgress: opts.onProgress });
   return r.status === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
 }
 
 // Anti-transcript SELETIVO: inverte a fase do canal direito só nos intervalos
 // (palavras sensíveis). Assim o downmix mono da IA cancela só nesses trechos,
 // enquanto o humano ouve tudo normalmente. Vídeo é copiado (sem re-encode).
-function applySmartAntiTranscribe(inputPath, ranges, outputPath) {
+async function applySmartAntiTranscribe(inputPath, ranges, outputPath, opts = {}) {
   const enable = ranges
     .map(([s, e]) => `between(t,${s.toFixed(3)},${e.toFixed(3)})`)
     .join('+');
@@ -227,23 +306,51 @@ function applySmartAntiTranscribe(inputPath, ranges, outputPath) {
     outputPath,
   ];
   console.log(`FFmpeg smart-anti cmd: ${ffmpegPath} ${args.join(' ')}`);
-  const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
+  const result = await runFfmpeg(args, { durationSec: opts.durationSec, onProgress: opts.onProgress });
   const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000;
-  if (!ok && result.stderr) console.log('Smart-anti stderr (last 500):', result.stderr.toString().slice(-500));
-  return { ok, err: result.stderr?.toString().slice(-300) || '', status: result.status, signal: result.signal };
+  if (!ok && result.err) console.log('Smart-anti stderr (last 300):', result.err);
+  return { ok, err: result.err || '', status: result.status, signal: result.signal };
 }
 
-app.post('/process/', upload.fields([
-  { name: 'file', maxCount: 1 },
-  { name: 'hidden_audio_file', maxCount: 1 },
-  { name: 'bumper_image_file', maxCount: 1 }
-]), async (req, res) => {
-  if (!req.files || !req.files['file']) {
-    return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
-  }
+// Comprime o vídeo para caber num tamanho-alvo (bitrate calculado a partir da
+// duração). Mira ~94% do limite e, se estourar, reencoda uma vez com alvo menor.
+async function compressUnderSize(inputPath, durationSec, outputPath, limitBytes, opts = {}) {
+  const audioKbps = 128;
+  const attempt = async (targetBytes) => {
+    const totalKbps = Math.floor((targetBytes * 8) / durationSec / 1000);
+    let videoKbps = totalKbps - audioKbps;
+    if (videoKbps < 100) videoKbps = 100;
+    const bufKbps = videoKbps * 2;
+    const r = await runFfmpeg([
+      '-y', '-i', inputPath,
+      '-c:v', 'libx264', '-preset', 'veryfast',
+      '-b:v', `${videoKbps}k`, '-maxrate', `${videoKbps}k`, '-bufsize', `${bufKbps}k`,
+      '-c:a', 'aac', '-b:a', `${audioKbps}k`,
+      '-movflags', '+faststart',
+      outputPath,
+    ], { durationSec, onProgress: opts.onProgress });
+    const ok = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000;
+    return { ok, size: ok ? fs.statSync(outputPath).size : 0, err: r.err, status: r.status, signal: r.signal };
+  };
 
-  const body = req.body || {};
-  const settings = {
+  let res = await attempt(Math.floor(limitBytes * 0.94));
+  // Se ainda estourou o limite, recalcula pelo excesso real e reencoda uma vez.
+  if (res.ok && res.size > limitBytes) {
+    const ratio = (limitBytes * 0.90) / res.size;
+    try { fs.unlinkSync(outputPath); } catch {}
+    res = await attempt(Math.floor(limitBytes * 0.94 * ratio));
+  }
+  return res;
+}
+
+// Limite de tamanho quando "Limitar a 99 MB" está ligado. 99.000.000 bytes fica
+// seguro tanto para plataformas que contam 100 MB decimais (100.000.000) quanto
+// para 100 MiB (104.857.600).
+const SIZE_LIMIT_BYTES = 99 * 1000 * 1000;
+
+// Lê os campos do formulário -> objeto de settings.
+function parseSettings(body) {
+  return {
     do_uniqueize:            parseBool(body.do_uniqueize),
     do_audio_antitranscribe: parseBool(body.do_audio_antitranscribe),
     randomize_resolution:    parseBool(body.randomize_resolution),
@@ -261,15 +368,14 @@ app.post('/process/', upload.fields([
     do_capcut_noise:         parseBool(body.do_capcut_noise),
     capcut_noise_strength:   Math.min(100, Math.max(1, parseInt(body.capcut_noise_strength) || 15)),
     do_smart_antitranscribe: parseBool(body.do_smart_antitranscribe),
+    do_compress_100mb:       parseBool(body.do_compress_100mb),
     output_format:           body.output_format === 'mov' ? 'mov' : 'mp4',
   };
+}
 
-  console.log('settings:', JSON.stringify(settings));
-  const numCopies = Math.max(1, parseInt(body.num_copies) || 1);
-  const inputFile = req.files['file'][0];
-  console.log('inputFile:', inputFile?.originalname, inputFile?.size, inputFile?.path, 'exists:', fs.existsSync(inputFile?.path));
-  const hiddenFile = req.files['hidden_audio_file'] ? req.files['hidden_audio_file'][0] : null;
-  const bumperFile = req.files['bumper_image_file'] ? req.files['bumper_image_file'][0] : null;
+// Núcleo do processamento de UM vídeo (uma ou mais cópias). Relata o progresso
+// (0..100) via onProgress. Retorna { generatedFiles, smartWords, error }.
+async function runPipeline({ settings, numCopies, inputFile, hiddenFile, bumperFile, onProgress }) {
   const bumperImagePath = (settings.do_image_bumper && bumperFile) ? bumperFile.path : null;
   const bumperIsGif = !!bumperFile && (
     /gif/i.test(bumperFile.mimetype || '') || /\.gif$/i.test(bumperFile.originalname || '')
@@ -279,14 +385,37 @@ app.post('/process/', upload.fields([
   const originalName = inputFile.originalname || 'video.mp4';
   const ext = path.extname(originalName);
   const name = path.basename(originalName, ext);
-  const outExt = settings.output_format === 'mov' ? '.mov' : '.mp4'; // formato de saída escolhido
+  const outExt = settings.output_format === 'mov' ? '.mov' : '.mp4';
   const randPrefix = randInt(10000, 99999);
+
+  // Duração (para o cálculo de progresso e da compressão).
+  const durationSec = await getDurationSec(inputPath);
+
+  // ---- Contabilidade de progresso: cada "unidade" ≈ um passe de duração cheia.
+  const willSmart    = settings.do_smart_antitranscribe;
+  const willHalftone = settings.do_halftone;
+  const willBumper   = settings.do_image_bumper && bumperImagePath;
+  const willCompress = settings.do_compress_100mb;
+  let totalUnits =
+    (willSmart ? 1 : 0) + // extração de áudio p/ STT (uma vez)
+    numCopies * (1 + (willSmart ? 1 : 0) + (willHalftone ? 1 : 0) + (willBumper ? 1 : 0) + (willCompress ? 1 : 0));
+  if (totalUnits < 1) totalUnits = 1;
+  let completedUnits = 0;
+  const report = (frac = 0) => {
+    if (!onProgress) return;
+    const f = Math.min(Math.max(frac, 0), 1);
+    let p = Math.floor((100 * (completedUnits + f)) / totalUnits);
+    if (p > 99) p = 99; // 100 só ao concluir tudo
+    if (p < 0) p = 0;
+    onProgress(p);
+  };
+  report(0);
 
   // Prepara áudio fantasma se habilitado
   let hiddenAudioPath = null;
   if (settings.do_hidden_audio && hiddenFile) {
     hiddenAudioPath = `/tmp/${randPrefix}_hidden.wav`;
-    const ok = extractAudio(hiddenFile.path, hiddenAudioPath);
+    const ok = await extractAudio(hiddenFile.path, hiddenAudioPath);
     if (!ok) {
       console.warn('Falha ao extrair áudio fantasma, ignorando.');
       hiddenAudioPath = null;
@@ -294,18 +423,20 @@ app.post('/process/', upload.fields([
     try { fs.unlinkSync(hiddenFile.path); } catch {}
   }
 
-  // Anti-transcript inteligente: transcreve (Whisper local) -> Claude acha palavras
-  // sensíveis -> intervalos de tempo. Feito UMA vez (vale para todas as cópias).
+  // Anti-transcript inteligente: transcreve -> Claude acha palavras sensíveis
+  // -> intervalos. Feito UMA vez (vale para todas as cópias).
   let smartRanges = [];
   let smartWords = [];
   if (settings.do_smart_antitranscribe) {
     const audioStt = `/tmp/${randPrefix}_stt.m4a`;
     try {
-      if (extractAudioForStt(inputPath, audioStt)) {
+      const gotAudio = await extractAudioForStt(inputPath, audioStt, { durationSec, onProgress: report });
+      completedUnits++; report(0);
+      if (gotAudio) {
         console.log('smart: transcrevendo (AssemblyAI) + analisando com Claude...');
-        const res = await analyzeSensitiveRanges(audioStt);
-        smartRanges = res.ranges || [];
-        smartWords = res.sensitive || [];
+        const r = await analyzeSensitiveRanges(audioStt);
+        smartRanges = r.ranges || [];
+        smartWords = r.sensitive || [];
         console.log(`smart: ${smartWords.length} palavra(s) sensível(is):`, JSON.stringify(smartWords), 'ranges:', JSON.stringify(smartRanges));
       } else {
         console.warn('smart: falha ao extrair áudio, ignorando.');
@@ -355,8 +486,6 @@ app.post('/process/', upload.fields([
       vfParts.push(`noise=alls=${settings.capcut_noise_strength}:allf=t`);
     }
 
-    // (O Halftone agora é um passe separado por overlay de textura — muito mais rápido.)
-
     // Monta filtros de áudio
     const useHidden = settings.do_hidden_audio && hiddenAudioPath;
     const vol = settings.do_hidden_audio ? settings.hidden_audio_volume : 0.03;
@@ -365,8 +494,6 @@ app.post('/process/', upload.fields([
     const extraInputs = useHidden ? ['-i', hiddenAudioPath] : [];
 
     if (useHidden) {
-      // Áudio fantasma na faixa audível (fala: 300Hz–5kHz) a volume baixo.
-      // Humano ouve como "barulho de fundo suave"; IA de transcrição capta e se confunde.
       let mainChain = '[0:a]';
       const mainFilters = [];
       if (settings.do_uniqueize && settings.randomize_volume) {
@@ -377,7 +504,6 @@ app.post('/process/', upload.fields([
       }
       mainChain += (mainFilters.length ? mainFilters.join(',') + ',' : '') + 'aformat=sample_rates=48000[main_a]';
 
-      // Loop o fantasma para cobrir toda a duração, mantém na faixa de fala (bandpass 300–5000Hz)
       const hiddenChain =
         `[1:a]aloop=loop=-1:size=2147483647,` +
         `bandpass=f=1500:width_type=o:width=4,` +
@@ -397,7 +523,7 @@ app.post('/process/', upload.fields([
       }
     }
 
-    // Monta comando FFmpeg
+    // Monta comando FFmpeg (pass 1)
     const args = ['-y', '-i', inputPath, ...extraInputs];
 
     if (settings.do_uniqueize || settings.do_capcut_noise) {
@@ -422,28 +548,25 @@ app.post('/process/', upload.fields([
 
     console.log(`FFmpeg cmd: ${ffmpegPath} ${args.join(' ')}`);
     try {
-      const result = spawnSync(ffmpegPath, args, { timeout: 300000 });
-      const ffmpegErr = result.stderr?.toString() || '';
-      const ffmpegOut = result.stdout?.toString() || '';
+      const result = await runFfmpeg(args, { durationSec, onProgress: report });
+      completedUnits++; report(0); // pass 1 concluído
       const outputExists = fs.existsSync(outputFilename);
-
       console.log(`FFmpeg status=${result.status} signal=${result.signal} outputExists=${outputExists}`);
-      if (ffmpegErr) console.log('FFmpeg stderr (last 500):', ffmpegErr.slice(-500));
+      if (result.err) console.log('FFmpeg stderr (last 300):', result.err);
 
       const outputSize = outputExists ? fs.statSync(outputFilename).size : 0;
-      const success = outputExists && outputSize > 1000; // arquivo válido
-
+      const success = outputExists && outputSize > 1000;
       console.log(`FFmpeg outputSize=${outputSize} success=${success}`);
 
       if (success) {
-        // Cadeia de passes extras: pass1 -> Smart-anti -> Halftone -> Bumper -> final
-        // Cada passe grava num arquivo próprio; no fim renomeamos o sobrevivente.
+        // Cadeia de passes extras: pass1 -> Smart-anti -> Halftone -> Bumper -> Compressão -> final
         let curFile = outputFilename;
 
         // Passe Anti-transcript inteligente (inversão só nos trechos sensíveis)
         if (useSmart) {
           const t = `${base}_ps${outExt}`;
-          const s = applySmartAntiTranscribe(curFile, smartRanges, t);
+          const s = await applySmartAntiTranscribe(curFile, smartRanges, t, { durationSec, onProgress: report });
+          completedUnits++; report(0);
           if (s.ok) {
             try { fs.unlinkSync(curFile); } catch {}
             curFile = t;
@@ -457,7 +580,8 @@ app.post('/process/', upload.fields([
         // Passe Halftone (overlay de textura de pontos)
         if (useHalftone) {
           const t = `${base}_ph${outExt}`;
-          const ht = applyHalftoneOverlay(curFile, settings.halftone_opacity, t, base);
+          const ht = await applyHalftoneOverlay(curFile, settings.halftone_opacity, t, base, { durationSec, onProgress: report });
+          completedUnits++; report(0);
           if (ht.ok) {
             try { fs.unlinkSync(curFile); } catch {}
             curFile = t;
@@ -472,7 +596,8 @@ app.post('/process/', upload.fields([
         if (useBumper) {
           const t = `${base}_pb${outExt}`;
           const startDur = (randInt(1, 2) / 30).toFixed(3); // 1–2 frames a 30fps
-          const b = addImageBumper(curFile, bumperImagePath, settings.bumper_position, startDur, settings.bumper_end_seconds, t, bumperIsGif);
+          const b = await addImageBumper(curFile, bumperImagePath, settings.bumper_position, startDur, settings.bumper_end_seconds, t, bumperIsGif, { durationSec, onProgress: report });
+          completedUnits++; report(0);
           if (b.ok) {
             try { fs.unlinkSync(curFile); } catch {}
             curFile = t;
@@ -483,7 +608,7 @@ app.post('/process/', upload.fields([
           }
         }
 
-        // Renomeia o sobrevivente para o nome final
+        // Renomeia o sobrevivente para o nome final (antes da compressão)
         if (curFile !== finalOutput) {
           try {
             if (fs.existsSync(finalOutput)) fs.unlinkSync(finalOutput);
@@ -492,13 +617,39 @@ app.post('/process/', upload.fields([
             console.error('rename final falhou:', e.message);
           }
         }
+
+        // Passe Compressão: se ligado e o arquivo passar do limite, reencoda p/ ≤ limite.
+        if (settings.do_compress_100mb) {
+          const sz = fs.existsSync(finalOutput) ? fs.statSync(finalOutput).size : 0;
+          if (sz > SIZE_LIMIT_BYTES && durationSec) {
+            const t = `${base}_cz${outExt}`;
+            const c = await compressUnderSize(finalOutput, durationSec, t, SIZE_LIMIT_BYTES, { onProgress: report });
+            if (c.ok) {
+              try { fs.unlinkSync(finalOutput); } catch {}
+              fs.renameSync(t, finalOutput);
+              if (c.size > SIZE_LIMIT_BYTES) {
+                lastFfmpegError = `compress: melhor esforço ${(c.size / 1e6).toFixed(1)}MB (acima do limite)`;
+                console.warn(lastFfmpegError);
+              }
+            } else {
+              lastFfmpegError = `compress falhou: status=${c.status} signal=${c.signal} err=${c.err}`;
+              console.error(`Compress failed (copy ${i}):`, lastFfmpegError);
+              try { if (fs.existsSync(t)) fs.unlinkSync(t); } catch {}
+            }
+          } else if (sz > SIZE_LIMIT_BYTES && !durationSec) {
+            lastFfmpegError = 'compress: duração desconhecida, não foi possível comprimir';
+            console.warn(lastFfmpegError);
+          }
+          completedUnits++; report(0); // conta a unidade mesmo quando pula
+        }
+
         generatedFiles.push(finalOutput);
       } else {
-        lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} size=${outputSize} err=${ffmpegErr.slice(-300) || ffmpegOut.slice(-300)}`;
+        lastFfmpegError = `status=${result.status} signal=${result.signal} outputExists=${outputExists} size=${outputSize} err=${result.err}`;
         console.error(`FFmpeg failed (copy ${i}):`, lastFfmpegError);
       }
     } catch (e) {
-      lastFfmpegError = `spawnSync exception: ${e.message}`;
+      lastFfmpegError = `spawn exception: ${e.message}`;
       console.error(`FFmpeg exception (copy ${i}):`, lastFfmpegError);
     }
   }
@@ -507,47 +658,172 @@ app.post('/process/', upload.fields([
   if (hiddenAudioPath) { try { fs.unlinkSync(hiddenAudioPath); } catch {} }
   if (bumperFile) { try { fs.unlinkSync(bumperFile.path); } catch {} }
 
-  if (generatedFiles.length === 0) {
-    return res.status(500).json({ error: 'Falha no processamento do vídeo.', detail: lastFfmpegError });
+  return {
+    generatedFiles,
+    smartWords: settings.do_smart_antitranscribe ? smartWords : null,
+    name,
+    outExt,
+    outputFormat: settings.output_format,
+    error: generatedFiles.length === 0 ? (lastFfmpegError || 'Falha no processamento do vídeo.') : '',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fila de jobs: cada vídeo enviado vira um job; processados UM DE CADA VEZ.
+// ---------------------------------------------------------------------------
+const jobs = new Map(); // id -> job
+const queue = [];       // ids na ordem de chegada
+let working = false;
+
+function pump() {
+  if (working) return;
+  const id = queue.shift();
+  if (!id) return;
+  const job = jobs.get(id);
+  if (!job) return pump();
+  working = true;
+  job.status = 'processing';
+  processJob(job)
+    .catch((e) => {
+      job.status = 'error';
+      job.error = e.message || String(e);
+    })
+    .finally(() => {
+      working = false;
+      pump();
+    });
+}
+
+async function processJob(job) {
+  const { generatedFiles, smartWords, name, outExt, outputFormat, error } = await runPipeline({
+    settings: job.settings,
+    numCopies: job.numCopies,
+    inputFile: job.inputFile,
+    hiddenFile: job.hiddenFile,
+    bumperFile: job.bumperFile,
+    onProgress: (p) => { job.progress = p; },
+  });
+
+  job.smartWords = smartWords;
+
+  if (!generatedFiles.length) {
+    job.status = 'error';
+    job.error = error;
+    return;
+  }
+
+  // Empacota o resultado em disco para download posterior via GET.
+  if (generatedFiles.length === 1) {
+    job.resultPath = generatedFiles[0];
+    job.resultName = `processed_${name}${outExt}`;
+    job.resultType = outputFormat === 'mov' ? 'video/quicktime' : 'video/mp4';
+  } else {
+    const zipPath = `/tmp/${Date.now()}_${name}_processed.zip`;
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(zipPath);
+      const archive = archiver('zip');
+      out.on('close', resolve);
+      archive.on('error', reject);
+      archive.pipe(out);
+      for (const f of generatedFiles) {
+        archive.file(f, { name: path.basename(f) });
+      }
+      archive.finalize();
+    });
+    for (const f of generatedFiles) { try { fs.unlinkSync(f); } catch {} }
+    job.resultPath = zipPath;
+    job.resultName = `${name}_processed.zip`;
+    job.resultType = 'application/zip';
+  }
+
+  job.progress = 100;
+  job.status = 'done';
+  job.doneAt = Date.now();
+}
+
+// Cria um job (recebe o arquivo + settings) e o coloca na fila.
+app.post('/jobs', upload.fields([
+  { name: 'file', maxCount: 1 },
+  { name: 'hidden_audio_file', maxCount: 1 },
+  { name: 'bumper_image_file', maxCount: 1 }
+]), (req, res) => {
+  if (!req.files || !req.files['file']) {
+    return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
+  }
+  const body = req.body || {};
+  const settings = parseSettings(body);
+  const numCopies = Math.max(1, parseInt(body.num_copies) || 1);
+
+  const id = crypto.randomBytes(8).toString('hex');
+  const job = {
+    id,
+    status: 'queued',
+    progress: 0,
+    error: '',
+    settings,
+    numCopies,
+    inputFile: req.files['file'][0],
+    hiddenFile: req.files['hidden_audio_file'] ? req.files['hidden_audio_file'][0] : null,
+    bumperFile: req.files['bumper_image_file'] ? req.files['bumper_image_file'][0] : null,
+    createdAt: Date.now(),
+  };
+  jobs.set(id, job);
+  queue.push(id);
+  console.log(`job ${id} enfileirado: ${job.inputFile.originalname} (${job.inputFile.size} bytes)`);
+  pump();
+  res.json({ jobId: id });
+});
+
+// Status do job (para a barra de progresso da UI).
+app.get('/jobs/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado.' });
+  res.json({
+    status: job.status,
+    progress: job.progress,
+    error: job.error || '',
+    resultReady: job.status === 'done',
+    sensitiveWords: job.smartWords || null,
+  });
+});
+
+// Baixa o resultado do job e limpa os arquivos temporários.
+app.get('/jobs/:id/result', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado.' });
+  if (job.status !== 'done' || !job.resultPath || !fs.existsSync(job.resultPath)) {
+    return res.status(409).json({ error: 'Resultado ainda não disponível.' });
+  }
+
+  const filePath = job.resultPath;
+  res.setHeader('Content-Disposition', `attachment; filename="${job.resultName}"`);
+  res.setHeader('Content-Type', job.resultType || 'application/octet-stream');
+  if (job.smartWords) {
+    res.setHeader('Access-Control-Expose-Headers', 'X-Sensitive-Words');
+    res.setHeader('X-Sensitive-Words', encodeURIComponent(JSON.stringify(job.smartWords)));
   }
 
   const cleanup = () => {
-    generatedFiles.forEach((f) => { try { fs.unlinkSync(f); } catch {} });
+    try { fs.unlinkSync(filePath); } catch {}
+    jobs.delete(job.id);
   };
-
-  // Expõe as palavras sensíveis detectadas (pra UI mostrar o que foi "mutado")
-  if (settings.do_smart_antitranscribe) {
-    res.setHeader('Access-Control-Expose-Headers', 'X-Sensitive-Words');
-    res.setHeader('X-Sensitive-Words', encodeURIComponent(JSON.stringify(smartWords)));
-  }
-
-  if (generatedFiles.length === 1) {
-    const filePath = generatedFiles[0];
-    const niceName = `processed_${name}${outExt}`;
-    res.setHeader('Content-Disposition', `attachment; filename="${niceName}"`);
-    res.setHeader('Content-Type', settings.output_format === 'mov' ? 'video/quicktime' : 'video/mp4');
-    const stream = fs.createReadStream(filePath);
-    stream.on('end', cleanup);
-    stream.on('error', cleanup);
-    return stream.pipe(res);
-  }
-
-  const zipPath = `/tmp/${randPrefix}_${name}_processed.zip`;
-  const niceName = `${name}_processed.zip`;
-  res.setHeader('Content-Disposition', `attachment; filename="${niceName}"`);
-  res.setHeader('Content-Type', 'application/zip');
-
-  const archive = archiver('zip');
-  archive.on('end', cleanup);
-  archive.pipe(res);
-
-  for (const f of generatedFiles) {
-    const zipItemName = path.basename(f).replace(`${randPrefix}_`, '');
-    archive.file(f, { name: zipItemName });
-  }
-
-  await archive.finalize();
+  const stream = fs.createReadStream(filePath);
+  stream.on('end', cleanup);
+  stream.on('error', cleanup);
+  stream.pipe(res);
 });
+
+// Varredura periódica: remove jobs órfãos (não baixados) após 60 min.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    const age = now - (job.doneAt || job.createdAt);
+    if (age > 60 * 60 * 1000) {
+      if (job.resultPath) { try { fs.unlinkSync(job.resultPath); } catch {} }
+      jobs.delete(id);
+    }
+  }
+}, 10 * 60 * 1000).unref();
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
