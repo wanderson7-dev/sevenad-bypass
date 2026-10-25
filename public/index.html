@@ -982,6 +982,15 @@
                 </div>
             </div>
 
+            <!-- Baixar tudo em um ZIP -->
+            <div style="display:flex;align-items:center;justify-content:center;gap:0.8rem;margin-bottom:1.4rem;">
+                <label class="switch">
+                    <input type="checkbox" id="do_zip_all" name="do_zip_all">
+                    <span class="slider"></span>
+                </label>
+                <span class="option-desc" style="white-space:nowrap;">📦 Baixar tudo em um único .zip no final</span>
+            </div>
+
             <button type="submit" class="btn-magic" id="submitBtn" disabled>
                 <svg viewBox="0 0 24 24">
                     <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
@@ -1302,6 +1311,8 @@
             isRunning = true;
             renderQueue();
 
+            const zipAll = document.getElementById('do_zip_all').checked;
+            const doneJobIds = [];
             const hiddenFile = document.getElementById('do_hidden_audio').checked ? hiddenInput.files[0] : null;
             const bumperFile = document.getElementById('do_image_bumper').checked ? bumperInput.files[0] : null;
 
@@ -1340,14 +1351,20 @@
                         if (s.status === 'error') throw new Error(s.error || 'Falha no processamento.');
                     }
 
-                    // 3) baixa o resultado
-                    const rr = await fetch(`/jobs/${jobId}/result`);
-                    if (!rr.ok) throw new Error('Falha ao baixar o resultado.');
-                    let filename = 'processed_media.mp4';
-                    const disp = rr.headers.get('content-disposition');
-                    if (disp && disp.includes('filename=')) filename = disp.split('filename=')[1].replace(/"/g, '');
-                    const blob = await rr.blob();
-                    triggerDownload(blob, filename);
+                    // 3) resultado pronto
+                    if (zipAll) {
+                        // modo ZIP: não baixa agora; guarda o job pro .zip final
+                        doneJobIds.push(jobId);
+                    } else {
+                        // modo normal: baixa o resultado deste item na hora
+                        const rr = await fetch(`/jobs/${jobId}/result`);
+                        if (!rr.ok) throw new Error('Falha ao baixar o resultado.');
+                        let filename = 'processed_media.mp4';
+                        const disp = rr.headers.get('content-disposition');
+                        if (disp && disp.includes('filename=')) filename = disp.split('filename=')[1].replace(/"/g, '');
+                        const blob = await rr.blob();
+                        triggerDownload(blob, filename);
+                    }
 
                     if (sensitiveWords) showSensitive(sensitiveWords);
 
@@ -1360,6 +1377,18 @@
                     updateItemUI(item);
                 }
                 renderQueue();
+            }
+
+            // modo ZIP: baixa todos os criativos processados em um único .zip
+            if (zipAll && doneJobIds.length) {
+                try {
+                    const rr = await fetch(`/jobs/zip?ids=${doneJobIds.join(',')}`);
+                    if (!rr.ok) throw new Error('Falha ao gerar o ZIP.');
+                    const blob = await rr.blob();
+                    triggerDownload(blob, 'criativos_processados.zip');
+                } catch (err) {
+                    alert('Erro ao baixar o ZIP: ' + err.message);
+                }
             }
 
             isRunning = false;

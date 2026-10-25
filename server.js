@@ -23,18 +23,22 @@ const fs = require('fs');
 const crypto = require('crypto');
 const archiver = require('archiver');
 const { analyzeSensitiveRanges } = require('./smart');
-// Usa ffmpeg do sistema (Docker/Railway) se disponível, senão usa ffmpeg-static (local)
+// Usa ffmpeg do sistema (Docker/Railway) se existir E conseguir executar
+// (num Mac ARM o binário x86_64 em /usr/local/bin falha sem Rosetta);
+// caso contrário cai no ffmpeg-static (local).
+function runnable(bin) {
+  if (!bin) return false;
+  try { execSync(`"${bin}" -version`, { stdio: 'ignore' }); return true; } catch { return false; }
+}
 let ffmpegPath;
-try {
-  ffmpegPath = execSync('which ffmpeg').toString().trim();
-} catch {
+try { ffmpegPath = execSync('which ffmpeg').toString().trim(); } catch { ffmpegPath = null; }
+if (!runnable(ffmpegPath)) {
   ffmpegPath = require('ffmpeg-static');
 }
 // ffprobe (para descobrir a resolução do vídeo no filtro Halftone)
 let ffprobePath = null;
-try {
-  ffprobePath = execSync('which ffprobe').toString().trim();
-} catch {
+try { ffprobePath = execSync('which ffprobe').toString().trim(); } catch { ffprobePath = null; }
+if (!runnable(ffprobePath)) {
   ffprobePath = null;
 }
 
@@ -712,28 +716,17 @@ async function processJob(job) {
     return;
   }
 
-  // Empacota o resultado em disco para download posterior via GET.
+  // Guarda os arquivos gerados em disco (sem pré-zipar) para download posterior,
+  // seja individual (GET /jobs/:id/result) ou em lote (GET /jobs/zip).
+  job.outputFormat = outputFormat;
+  job.resultType = outputFormat === 'mov' ? 'video/quicktime' : 'video/mp4';
   if (generatedFiles.length === 1) {
-    job.resultPath = generatedFiles[0];
-    job.resultName = `processed_${name}${outExt}`;
-    job.resultType = outputFormat === 'mov' ? 'video/quicktime' : 'video/mp4';
+    job.resultFiles = [{ path: generatedFiles[0], name: `processed_${name}${outExt}` }];
   } else {
-    const zipPath = `/tmp/${Date.now()}_${name}_processed.zip`;
-    await new Promise((resolve, reject) => {
-      const out = fs.createWriteStream(zipPath);
-      const archive = archiver('zip');
-      out.on('close', resolve);
-      archive.on('error', reject);
-      archive.pipe(out);
-      for (const f of generatedFiles) {
-        archive.file(f, { name: path.basename(f) });
-      }
-      archive.finalize();
-    });
-    for (const f of generatedFiles) { try { fs.unlinkSync(f); } catch {} }
-    job.resultPath = zipPath;
-    job.resultName = `${name}_processed.zip`;
-    job.resultType = 'application/zip';
+    job.resultFiles = generatedFiles.map((f, i) => ({
+      path: f,
+      name: `processed_${name}_v${i + 1}${outExt}`,
+    }));
   }
 
   job.progress = 100;
@@ -774,6 +767,57 @@ app.post('/jobs', upload.fields([
   res.json({ jobId: id });
 });
 
+// Baixa VÁRIOS jobs de uma vez em um único .zip e limpa os temporários.
+// Precisa vir ANTES de "/jobs/:id", senão o ":id" captura "zip".
+app.get('/jobs/zip', (req, res) => {
+  const ids = String(req.query.ids || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!ids.length) return res.status(400).json({ error: 'Nenhum job informado.' });
+
+  const ready = [];
+  const jobSet = new Set();
+  for (const id of ids) {
+    const job = jobs.get(id);
+    if (!job || job.status !== 'done' || !job.resultFiles) continue;
+    for (const f of job.resultFiles) {
+      if (fs.existsSync(f.path)) { ready.push(f); jobSet.add(job); }
+    }
+  }
+  if (!ready.length) return res.status(409).json({ error: 'Nenhum resultado disponível.' });
+
+  res.setHeader('Content-Disposition', 'attachment; filename="criativos_processados.zip"');
+  res.setHeader('Content-Type', 'application/zip');
+
+  const archive = archiver('zip');
+  archive.on('error', () => { try { res.end(); } catch {} });
+  archive.pipe(res);
+
+  const used = new Set();
+  for (const f of ready) {
+    let name = f.name;
+    if (used.has(name)) {
+      const dot = name.lastIndexOf('.');
+      const stem = dot >= 0 ? name.slice(0, dot) : name;
+      const ext = dot >= 0 ? name.slice(dot) : '';
+      let n = 2;
+      while (used.has(`${stem}_${n}${ext}`)) n++;
+      name = `${stem}_${n}${ext}`;
+    }
+    used.add(name);
+    archive.file(f.path, { name });
+  }
+  archive.finalize();
+
+  res.on('finish', () => {
+    for (const job of jobSet) {
+      for (const f of job.resultFiles) { try { fs.unlinkSync(f.path); } catch {} }
+      jobs.delete(job.id);
+    }
+  });
+});
+
 // Status do job (para a barra de progresso da UI).
 app.get('/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
@@ -787,30 +831,46 @@ app.get('/jobs/:id', (req, res) => {
   });
 });
 
-// Baixa o resultado do job e limpa os arquivos temporários.
+// Baixa o resultado de UM job e limpa os arquivos temporários.
 app.get('/jobs/:id/result', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job não encontrado.' });
-  if (job.status !== 'done' || !job.resultPath || !fs.existsSync(job.resultPath)) {
+  const files = (job.status === 'done' && job.resultFiles)
+    ? job.resultFiles.filter((f) => fs.existsSync(f.path))
+    : [];
+  if (!files.length) {
     return res.status(409).json({ error: 'Resultado ainda não disponível.' });
   }
 
-  const filePath = job.resultPath;
-  res.setHeader('Content-Disposition', `attachment; filename="${job.resultName}"`);
-  res.setHeader('Content-Type', job.resultType || 'application/octet-stream');
   if (job.smartWords) {
     res.setHeader('Access-Control-Expose-Headers', 'X-Sensitive-Words');
     res.setHeader('X-Sensitive-Words', encodeURIComponent(JSON.stringify(job.smartWords)));
   }
 
   const cleanup = () => {
-    try { fs.unlinkSync(filePath); } catch {}
+    for (const f of job.resultFiles) { try { fs.unlinkSync(f.path); } catch {} }
     jobs.delete(job.id);
   };
-  const stream = fs.createReadStream(filePath);
-  stream.on('end', cleanup);
-  stream.on('error', cleanup);
-  stream.pipe(res);
+
+  // 1 cópia → baixa o vídeo direto; várias cópias → empacota em zip na hora.
+  if (files.length === 1) {
+    res.setHeader('Content-Disposition', `attachment; filename="${files[0].name}"`);
+    res.setHeader('Content-Type', job.resultType || 'application/octet-stream');
+    const stream = fs.createReadStream(files[0].path);
+    stream.on('end', cleanup);
+    stream.on('error', cleanup);
+    stream.pipe(res);
+  } else {
+    const base = files[0].name.replace(/\.[^.]+$/, '');
+    res.setHeader('Content-Disposition', `attachment; filename="${base}.zip"`);
+    res.setHeader('Content-Type', 'application/zip');
+    const archive = archiver('zip');
+    archive.on('error', () => { try { res.end(); } catch {} });
+    archive.pipe(res);
+    for (const f of files) archive.file(f.path, { name: f.name });
+    archive.finalize();
+    res.on('finish', cleanup);
+  }
 });
 
 // Varredura periódica: remove jobs órfãos (não baixados) após 60 min.
@@ -819,7 +879,9 @@ setInterval(() => {
   for (const [id, job] of jobs) {
     const age = now - (job.doneAt || job.createdAt);
     if (age > 60 * 60 * 1000) {
-      if (job.resultPath) { try { fs.unlinkSync(job.resultPath); } catch {} }
+      if (job.resultFiles) {
+        for (const f of job.resultFiles) { try { fs.unlinkSync(f.path); } catch {} }
+      }
       jobs.delete(id);
     }
   }
